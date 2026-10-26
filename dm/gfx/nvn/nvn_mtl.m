@@ -9906,7 +9906,9 @@ static id<MTLTexture> present_raw_src(id<MTLTexture> src) {
 }
 // The rectangle of the canvas (dw x dh) the picture (cw x ch) is drawn into: the picture's aspect ratio kept and centred, black bars in the rest (no stretching when the screen's ratio
 // differs from the game's, e.g. iPhone about 19.5:9 against the game's 16:9); when the ratios differ by under 1 % (the remainder from a game width that is a multiple of 8 in the
-// full-screen setup, e.g. 1952x900 against 2868x1320 differs by 0.17 %) the whole canvas, leaving no border of a few pixels
+// full-screen setup, e.g. 1952x900 against 2868x1320 differs by 0.17 %) the whole canvas, leaving no border of a few pixels. The picture's shape is the whole texture's, not
+// its crop's: the Switch scales a crop (nvnWindowSetCrop, vi::SetLayerCrop) to the full layer, so Super Mario Galaxy 2's docked 1200x960 crop of its 1920x1080 swapchain (the
+// Wii's anamorphic picture) fills 16:9 rather than showing at 5:4 with bars
 static MTLViewport present_viewport(double cw, double ch, double dw, double dh) {
     double s = fmin(dw / cw, dh / ch);
     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
@@ -9933,7 +9935,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     present_pipeline(dst.pixelFormat);
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     double dw = dst.width, dh = dst.height;
-    MTLViewport vp = present_viewport(cw, ch, dw, dh);
+    MTLViewport vp = present_viewport(src.width, src.height, dw, dh);   // the shape of the whole texture: see present_viewport
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     static double last_vp[4];   // Log one line when the viewport changes (used by the real-device screen-level acceptance screen_check.py to check the aspect ratio)
     if (memcmp(last_vp, &vp, sizeof last_vp)) { memcpy(last_vp, &vp, sizeof last_vp);
@@ -10025,7 +10027,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     NSUInteger r[4]; if (!present_crop_rect(src, crop, r)) return 0;
     present_pipeline(dst.pixelFormat);
     double dw = dst.width, dh = dst.height;
-    MTLViewport vp = present_viewport(r[2], r[3], dw, dh);
+    MTLViewport vp = present_viewport(src.width, src.height, dw, dh);   // the shape of the whole texture: see present_viewport
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     id<MTLTexture> tex = present_raw_src(src), up = fx ? fx_encode(fx, cb, tex, r, vp, dst.pixelFormat, fx == &g_fx_present) : nil;
     if (up) { tex = up; r[0] = r[1] = 0; r[2] = up.width; r[3] = up.height; }   // the scaled picture, the viewport's size: drawn 1:1
