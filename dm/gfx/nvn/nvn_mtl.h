@@ -46,4 +46,7 @@ void *mtl_device(void);
 void *mtl_device_classic(void);   // the same for a layer that draws only on classic queues: a device without Metal 4 (a virtual Mac) starts too, and its presents are dropped
 uint64_t mtl_ext_tex(void *tex);
 uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]);   // crop: x, y, w, h of the texture to show (NULL = all of it)
+int mtl_upscale_get(void);       // MetalFX spatial upscaling in the present: 1 on, 0 off (DM_PRESENT_UPSCALE at start)
+int mtl_upscale_set(int on);     // switches it while the game runs (the Mac in-game menu); returns the mode now in force
+void mtl_hdr_set(float peak);    // Auto HDR in the present: highlights lifted up to peak x SDR white (needs the layer in RGBA16Float, extended linear sRGB); 0 or 1 = off
 void mtl_present_wait(uint64_t ticket);   // as in nvn_obj.h: wait until that present has been handed to the GPU

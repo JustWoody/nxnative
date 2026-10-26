@@ -1,6 +1,7 @@
 // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
 // Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
 // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN starts it that way. ⌘Q quits; the left mouse button is the touchscreen.
+// Escape or a controller's Home button opens the in-game menu (display, controls, mods: see the end of this file).
 // Key map (Nintendo layout): WASD left stick, arrow keys D-pad, J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
 // Controllers: buttons by position as on the iPhone (right A, bottom B, top X, left Y), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
@@ -23,6 +24,8 @@ static CAMetalLayer *g_layer;
 static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
+static int g_menu_open, g_menu_swallow, g_abxy = -2;   // the in-game menu (end of this file) is up; controller buttons held as it closed, kept from the game until released; DM_PAD_ABXY
+static int menu_key(unsigned short c, int down); static void menu_pad(uint64_t m, int32_t ly); static void menu_toggle(void); static void menu_home(void); static void hdr_apply(int lvl);
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
@@ -100,6 +103,7 @@ static int key_bit(unsigned short code) {
 static void on_key(NSEvent *e, int down) {
     if (!g_input_on) return;
     unsigned short c = e.keyCode;
+    if (menu_key(c, down)) return;
     switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
     int b = key_bit(c);
     uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
@@ -119,10 +123,10 @@ static int32_t pad_axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) *
 // Face buttons. macOS names a Nintendo controller's buttons by their labels (its buttonA is the button marked A, on the right), so the positional
 // map below swapped A/B and X/Y on a Switch Pro Controller. Nintendo pads (Pro Controller, Joy-Con) therefore map by label and the others by
 // position; DM_PAD_ABXY=label or position forces one map for every controller (auto, the default, decides per controller).
+static void abxy_init(void) { if (g_abxy == -2) { const char *e = getenv("DM_PAD_ABXY"); g_abxy = e && !strcmp(e, "label") ? 1 : e && !strcmp(e, "position") ? 0 : -1; } }
 static int pad_by_label(GCController *c) {
-    static int mode = -2;
-    if (mode == -2) { const char *e = getenv("DM_PAD_ABXY"); mode = e && !strcmp(e, "label") ? 1 : e && !strcmp(e, "position") ? 0 : -1; }
-    if (mode >= 0) return mode;
+    abxy_init();
+    if (g_abxy >= 0) return g_abxy;   // the in-game menu can change it
     NSString *s = [NSString stringWithFormat:@"%@ %@", c.productCategory ?: @"", c.vendorName ?: @""];
     for (NSString *n in @[@"Pro Controller", @"Joy-Con", @"Nintendo", @"Switch"])
         if ([s rangeOfString:n options:NSCaseInsensitiveSearch].location != NSNotFound) return 1;
@@ -140,6 +144,11 @@ static void pad_read(GCExtendedGamepad *g) {
     K(g.buttonMenu, DM_BTN_PLUS); K(g.buttonOptions, DM_BTN_MINUS); K(g.leftThumbstickButton, DM_BTN_LS); K(g.rightThumbstickButton, DM_BTN_RS);   // nil on pads without them: not pressed
     K(g.dpad.left, DM_BTN_LEFT); K(g.dpad.up, DM_BTN_UP); K(g.dpad.right, DM_BTN_RIGHT); K(g.dpad.down, DM_BTN_DOWN);
     #undef K
+    static int home_down; int home = g.buttonHome.isPressed;   // Home (a Pro Controller's, an 8BitDo's heart) opens and closes the in-game menu
+    if (home && !home_down) menu_home();
+    home_down = home;
+    if (g_menu_open) { menu_pad(m, pad_axis(g.leftThumbstick.yAxis.value)); return; }
+    if (g_menu_swallow) { if (m) m = 0; else g_menu_swallow = 0; }   // the button that closed the menu does not reach the game
     dm_pad_set_player(p, m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
@@ -171,7 +180,7 @@ static void motion_on(GCController *c) {
         g_gsign[1] < 0 ? "-" : "", 'x' + g_gaxis[1], g_gsign[2] < 0 ? "-" : "", 'x' + g_gaxis[2]);
     __weak GCController *wc = c;
     mo.valueChangedHandler = ^(GCMotion *m) {
-        GCController *cc = wc; if (!cc || !g_input_on) return;
+        GCController *cc = wc; if (!cc || !g_input_on || g_menu_open) return;
         int p = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)cc); if (p < 0) return;
         double a[3], w[3];
         if (m.hasGravityAndUserAcceleration) { a[0] = m.gravity.x + m.userAcceleration.x; a[1] = m.gravity.y + m.userAcceleration.y; a[2] = m.gravity.z + m.userAcceleration.z; }
@@ -200,7 +209,7 @@ static void pads_changed(GCController *gone) {
     if (g_merge) {
         int any = 0;
         for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone) {
-            any = 1; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
+            any = 1; c.extendedGamepad.buttonHome.preferredSystemGestureState = GCSystemGestureStateDisabled; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
             pad_read(c.extendedGamepad);
         }
         if (!any) { dm_pad_set(0, 0, 0, 0, 0); dm_haptics_apple_controller(0, nil); }
@@ -219,6 +228,7 @@ static void pads_changed(GCController *gone) {
         int p = pad_slot_take(&g_slots, (__bridge const void *)c, pad_name(c));
         if (p < 0) { LOG("controller '%s' connected: all %d players are taken, not used", pad_name(c), DM_PLAYERS); continue; }
         g_held[p] = c;
+        c.extendedGamepad.buttonHome.preferredSystemGestureState = GCSystemGestureStateDisabled;   // Home opens the in-game menu, not the system's
         c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
         npad_name(p, nb, sizeof nb); LOG("controller '%s' (%s) connected: player %d (npad %s), face buttons by %s", pad_name(c), c.productCategory.UTF8String ?: "?", p + 1, nb, pad_by_label(c) ? "label" : "position");
         motion_on(c);
@@ -261,6 +271,10 @@ static int pro_player(void) {   // the player of the first Pro Controller GameCo
 static void pro_report(void *ctx, IOReturn res, void *sender, IOHIDReportType type, uint32_t id, uint8_t *r, CFIndex len) {
     (void)ctx; (void)res; (void)sender; (void)type; (void)id;
     if (!g_input_on || len < 49 || r[0] != 0x30) return;
+    static int home_down; int home = (r[4] & 0x10) != 0;   // byte 4: − + RS LS Home Capture; macOS does not pass a Pro Controller's Home to GameController
+    if (home && !home_down) menu_home();
+    home_down = home;
+    if (g_menu_open || !g_gyro_state) return;
     static int first = 1;
     if (first) { first = 0; LOG("controller motion: reading the Pro Controller's own reports (HID 0x30)"); }
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -296,7 +310,7 @@ static void pro_found(void *ctx, IOReturn res, void *sender, IOHIDDeviceRef d) {
 static void pro_hid_start(void) {
     if (g_gyro_state < 0) gyro_init();
     const char *e = getenv("DM_GYRO_HID");
-    if (!g_gyro_state || (e && !strcmp(e, "0"))) return;
+    if (e && !strcmp(e, "0")) return;   // with motion off the reports still give the Home button (the in-game menu)
     g_hid = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
     IOHIDManagerSetDeviceMatching(g_hid, (__bridge CFDictionaryRef)@{@kIOHIDVendorIDKey: @0x057E, @kIOHIDProductIDKey: @0x2009});
     IOHIDManagerRegisterDeviceMatchingCallback(g_hid, pro_found, NULL);
@@ -321,7 +335,7 @@ static void pads_start(void) {
 @implementation DmGameView
 - (void)mouseDown:(NSEvent *)e { [self mouseDragged:e]; }
 - (void)mouseDragged:(NSEvent *)e {
-    if (!g_input_on) return;
+    if (!g_input_on || g_menu_open) return;
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil]; NSSize b = self.bounds.size;
     double w = b.width, h = b.height;
     if (w <= 0 || h <= 0) return;
@@ -395,6 +409,7 @@ void front_run(void (*guest)(void)) {
                 pads_changed(conn ? nil : c); }];
         dm_haptics_apple_init();
         pads_start();
+        if (getenv("DM_AUTO_HDR") && atoi(getenv("DM_AUTO_HDR")) > 0) hdr_apply(atoi(getenv("DM_AUTO_HDR")));   // Auto HDR from the start (the in-game menu sets it)
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
@@ -485,5 +500,217 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     if (!r) return 0;
     (void)max_chars;                              // Truncation is done uniformly in hle_swkbd.c in UTF-16 units
     snprintf(out, out_cap, "%s", text.UTF8String);
+    return 1;
+}
+
+// In-game menu: Escape, or the controller's Home button (a Pro Controller's Home, an 8BitDo's heart), opens a panel over the game. Up / down (arrow keys, the D-pad or the
+// left stick) choose a line, A / Return / Space / left / right change it, B / Escape / Home close it. The game is told it lost focus while the panel is up, and gets no input.
+// Display and control settings change at once; console mode and mods take a restart (the "Restart to apply" line), since the game reads them as it starts. Every change is
+// written to settings.env in the game's Application Support folder (DM_ROOT), which the launcher reads at the next start. Mods are the pchtxt mods the game was built or
+// patched with (<module>.mods.tsv beside the code): switching one off lists it in DM_MODS_OFF, whose patches the loader puts back to the original bytes (loader.c).
+int mtl_upscale_get(void); int mtl_upscale_set(int on);   // nvn_mtl.m
+void mtl_hdr_set(float peak);
+// Auto HDR (DM_AUTO_HDR=1 low, 2 medium, 3 high): the layer takes extended linear values and the present lifts the picture's highlights to 2, 3 or 4 times SDR white
+// (nvn_mtl.m hdr_consts), on a screen with HDR headroom such as a MacBook Pro's XDR display; SDR screens clip back to white
+static int g_hdr;
+static void hdr_apply(int lvl) {
+    static const float peak[4] = {0, 2, 3, 4};
+    g_hdr = lvl < 0 ? 0 : lvl > 3 ? 3 : lvl;
+    if (g_hdr) {
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+        g_layer.wantsExtendedDynamicRangeContent = YES; g_layer.colorspace = cs; g_layer.pixelFormat = MTLPixelFormatRGBA16Float; CGColorSpaceRelease(cs);
+        mtl_hdr_set(peak[g_hdr]);
+    } else { mtl_hdr_set(0); g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm; g_layer.colorspace = NULL; g_layer.wantsExtendedDynamicRangeContent = NO; }
+    LOG("front end: Auto HDR %s (screen headroom now %.1fx, up to %.1fx)", g_hdr ? (const char *[]){"", "low", "medium", "high"}[g_hdr] : "off",
+        g_win.screen.maximumExtendedDynamicRangeColorComponentValue, g_win.screen.maximumPotentialExtendedDynamicRangeColorComponentValue);
+}
+@interface DmMenuRow : NSObject
+@property (copy) NSString *title, *section; @property (copy) NSArray<NSString *> *choices; @property int restart, initial;
+@property (copy) int (^get)(void); @property (copy) void (^set)(int); @property (copy) void (^act)(void);
+@end
+@implementation DmMenuRow @end
+static NSMutableArray<DmMenuRow *> *g_rows;
+static NSView *g_menu; static int g_sel;
+static int g_restart_opmode = -1; static NSMutableOrderedSet<NSString *> *g_mods_all, *g_mods_off;
+
+// settings.env: KEY=value lines (a # comments a line out). A key the menu sets replaces its uncommented line, or is added at the end; nil removes the uncommented line
+static void settings_put(NSString *key, NSString *value) {
+    const char *root = getenv("DM_ROOT"); if (!root) return;
+    NSString *path = [@(root) stringByAppendingPathComponent:@"settings.env"];
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
+    if (lines.count && !lines.lastObject.length) [lines removeLastObject];
+    NSString *line = value ? [NSString stringWithFormat:@"%@=%@   # set in the in-game menu", key, value] : nil; int done = 0;
+    for (NSUInteger i = 0; i < lines.count; i++) {
+        NSString *t = [lines[i] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (![t hasPrefix:[key stringByAppendingString:@"="]]) continue;
+        if (line && !done) { lines[i] = line; done = 1; } else { [lines removeObjectAtIndex:i]; i--; }
+    }
+    if (line && !done) [lines addObject:line];
+    [[[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    LOG("in-game menu: settings.env %s=%s", key.UTF8String, value ? value.UTF8String : "(removed)");
+}
+static void mods_read(void) {   // every mod file named in the modules' mods records, and DM_MODS_OFF
+    g_mods_all = [NSMutableOrderedSet new]; g_mods_off = [NSMutableOrderedSet new];
+    const char *dir = dm_code_dir(); if (!dir || !*dir) return;
+    for (NSString *f in [[NSFileManager.defaultManager contentsOfDirectoryAtPath:@(dir) error:nil] sortedArrayUsingSelector:@selector(compare:)]) {
+        if (![f hasSuffix:@".mods.tsv"]) continue;
+        NSString *t = [NSString stringWithContentsOfFile:[@(dir) stringByAppendingPathComponent:f] encoding:NSUTF8StringEncoding error:nil];
+        for (NSString *l in [t componentsSeparatedByString:@"\n"]) {
+            NSArray<NSString *> *c = [l componentsSeparatedByString:@"\t"];
+            if ([l hasPrefix:@"#"] || c.count < 4 || !c[3].length) continue;
+            [g_mods_all addObject:c[3].lastPathComponent];
+        }
+    }
+    const char *off = getenv("DM_MODS_OFF");
+    if (off) for (NSString *s in [@(off) componentsSeparatedByString:@"|"]) if (s.length) [g_mods_off addObject:s];
+}
+static NSString *mod_label(NSString *file) {   // "Fl4sh9174 1920x1080 1.3.0-1.4.1.pchtxt" → "1920x1080 1.3.0-1.4.1 (Fl4sh9174)" when the first word is the author's
+    NSString *b = file.stringByDeletingPathExtension; NSRange sp = [b rangeOfString:@" "];
+    if (sp.location == NSNotFound) return b;
+    NSString *who = [b substringToIndex:sp.location], *what = [b substringFromIndex:sp.location + 1];
+    return [who rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet].location == NSNotFound || [who containsString:@"-"] ? [NSString stringWithFormat:@"%@ (%@)", what, who] : b;
+}
+static DmMenuRow *row(NSString *section, NSString *title, NSArray<NSString *> *choices, int (^get)(void), void (^set)(int)) {
+    DmMenuRow *r = [DmMenuRow new]; r.section = section; r.title = title; r.choices = choices; r.get = get; r.set = set; [g_rows addObject:r]; return r;
+}
+static int menu_pending(void) { for (DmMenuRow *r in g_rows) if (r.restart && r.get && r.get() != r.initial) return 1; return 0; }
+static void menu_close(void);
+static void menu_restart(void) {   // starts the app again a moment after this process has gone (open -n), then quits
+    NSString *app = NSBundle.mainBundle.bundlePath;
+    LOG("in-game menu: restarting %s", app.UTF8String);
+    NSTask *t = [NSTask new]; t.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+    t.arguments = @[@"-c", @"sleep 1; exec /usr/bin/open -n \"$0\"", app];
+    [t launchAndReturnError:nil];
+    [NSApp terminate:nil];
+}
+static void menu_build(void) {
+    g_rows = [NSMutableArray new]; mods_read();
+    NSArray *onoff = @[@"Off", @"On"];
+    row(@"Display", @"Full screen", onoff, ^int { return (g_win.styleMask & NSWindowStyleMaskFullScreen) != 0; },
+        ^(int v) { if (v != ((g_win.styleMask & NSWindowStyleMaskFullScreen) != 0)) [g_win toggleFullScreen:nil]; settings_put(@"DM_FULLSCREEN", v ? nil : @"0"); });
+    row(@"Display", @"Auto HDR", @[@"Off", @"Low", @"Medium", @"High"], ^int { return g_hdr; },
+        ^(int v) { hdr_apply(v); settings_put(@"DM_AUTO_HDR", v ? [NSString stringWithFormat:@"%d", v] : nil); });
+    row(@"Display", @"MetalFX upscaling", onoff, ^int { return mtl_upscale_get(); },
+        ^(int v) { settings_put(@"DM_PRESENT_UPSCALE", mtl_upscale_set(v) ? nil : @"off"); });
+    static int hud = -1; if (hud < 0) hud = getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"));   // Metal turns its HUD on as the process starts only
+    DmMenuRow *hr = row(@"Display", @"Performance overlay", onoff, ^int { return hud; }, ^(int v) { hud = v; settings_put(@"DM_METAL_HUD", v ? @"1" : nil); });
+    hr.restart = 1; hr.initial = getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"));
+    DmMenuRow *op = row(@"Display", @"Console mode", @[@"Handheld", @"Docked"], ^int { return g_restart_opmode; },
+        ^(int v) { g_restart_opmode = v; settings_put(@"DM_OPMODE", v ? @"1" : @"0"); });
+    op.restart = 1; op.initial = g_restart_opmode = dm_opmode() ? 1 : 0;
+    row(@"Controls", @"Motion controls (gyro)", onoff, ^int { return g_gyro_state != 0; }, ^(int v) {
+        if (g_gyro_state < 0) gyro_init();
+        g_gyro_state = v;
+        if (!v) { for (int p = 0; p < DM_PLAYERS; p++) dm_pad_motion_gone(p); }
+        else { for (GCController *c in GCController.controllers) motion_on(c); if (!g_hid) pro_hid_start(); }
+        settings_put(@"DM_GYRO", v ? nil : @"0"); });
+    abxy_init();
+    row(@"Controls", @"A B X Y buttons", @[@"Automatic", @"By label", @"By position"], ^int { return g_abxy < 0 ? 0 : g_abxy ? 1 : 2; }, ^(int v) {
+        g_abxy = v == 0 ? -1 : v == 1 ? 1 : 0;
+        settings_put(@"DM_PAD_ABXY", v == 0 ? nil : v == 1 ? @"label" : @"position"); });
+    for (NSString *m in g_mods_all) {
+        DmMenuRow *r = row(@"Mods", mod_label(m), onoff, ^int { return ![g_mods_off containsObject:m]; }, ^(int v) {
+            if (v) [g_mods_off removeObject:m]; else [g_mods_off addObject:m];
+            NSString *list = [g_mods_off.array componentsJoinedByString:@"|"];
+            settings_put(@"DM_MODS_OFF", list.length ? [NSString stringWithFormat:@"\"%@\"", list] : nil); });
+        r.restart = 1; r.initial = ![g_mods_off containsObject:m];
+    }
+    DmMenuRow *rs = row(@"", @"Restart to apply", nil, nil, nil); rs.act = ^{ menu_restart(); };
+    DmMenuRow *rz = row(@"", @"Resume game", nil, nil, nil); rz.act = ^{ menu_close(); };
+    DmMenuRow *q = row(@"", @"Quit game", nil, nil, nil); q.act = ^{ [NSApp terminate:nil]; };
+}
+static NSTextField *menu_label(NSString *s, CGFloat size, NSFontWeight w, NSColor *c, NSTextAlignment al) {
+    NSTextField *t = [NSTextField labelWithString:s]; t.font = [NSFont systemFontOfSize:size weight:w]; t.textColor = c; t.alignment = al; return t;
+}
+static void menu_draw(void) {
+    if (!g_menu) return;
+    for (NSView *v in [g_menu.subviews copy]) [v removeFromSuperview];
+    const CGFloat W = 520, rh = 30, pad = 22; int pending = menu_pending();
+    NSMutableArray<NSView *> *lines = [NSMutableArray new]; NSString *sec = nil; CGFloat h = 0;
+    NSMutableArray<NSNumber *> *ys = [NSMutableArray new];
+    for (NSUInteger i = 0; i < g_rows.count; i++) {
+        DmMenuRow *r = g_rows[i];
+        if (r.section.length && ![r.section isEqualToString:sec ?: @""]) {
+            sec = r.section; h += 8;
+            NSTextField *t = menu_label(r.section.uppercaseString, 11, NSFontWeightSemibold, [NSColor colorWithWhite:0.55 alpha:1], NSTextAlignmentLeft);
+            t.frame = NSMakeRect(pad, 0, W - 2 * pad, 18); [lines addObject:t]; [ys addObject:@(h)]; h += 20;
+        } else if (!r.section.length && sec) { sec = nil; h += 14; }
+        NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(10, 0, W - 20, rh)]; line.wantsLayer = YES; line.layer.cornerRadius = 6;
+        int dim = r.act && [r.title isEqualToString:@"Restart to apply"] && !pending;
+        if ((int)i == g_sel) line.layer.backgroundColor = [NSColor colorWithRed:0.18 green:0.42 blue:0.95 alpha:1].CGColor;
+        NSColor *fg = dim ? [NSColor colorWithWhite:0.45 alpha:1] : NSColor.whiteColor;
+        NSString *title = r.restart ? [r.title stringByAppendingString:@"  ↻"] : r.title;
+        NSTextField *tl = menu_label(title, 15, NSFontWeightRegular, fg, NSTextAlignmentLeft); tl.frame = NSMakeRect(12, 5, W - 220, 20); [line addSubview:tl];
+        if (r.choices) {
+            int v = r.get(); NSString *val = v >= 0 && v < (int)r.choices.count ? r.choices[v] : @"?";
+            NSTextField *vl = menu_label([NSString stringWithFormat:@"‹ %@ ›", val], 15, NSFontWeightMedium, fg, NSTextAlignmentRight); vl.frame = NSMakeRect(W - 220, 5, 186, 20); [line addSubview:vl];
+        }
+        [lines addObject:line]; [ys addObject:@(h)]; h += rh;
+    }
+    NSTextField *head = menu_label(@DM_GAME_NAME, 20, NSFontWeightSemibold, NSColor.whiteColor, NSTextAlignmentLeft);
+    NSTextField *foot = menu_label(pending ? @"↻ changes apply after a restart; progress not saved in the game is lost" : @"↻ needs a restart  ·  Esc or Home closes",
+                                   12, NSFontWeightRegular, [NSColor colorWithWhite:pending ? 0.85 : 0.55 alpha:1], NSTextAlignmentLeft);
+    CGFloat H = h + 44 + 40 + 2 * pad;
+    NSView *panel = [[NSView alloc] initWithFrame:NSMakeRect(floor((g_menu.bounds.size.width - W) / 2), floor((g_menu.bounds.size.height - H) / 2), W, H)];
+    panel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+    panel.wantsLayer = YES; panel.layer.backgroundColor = [NSColor colorWithWhite:0.11 alpha:0.97].CGColor; panel.layer.cornerRadius = 14;
+    head.frame = NSMakeRect(pad, H - pad - 28, W - 2 * pad, 28); [panel addSubview:head];
+    for (NSUInteger i = 0; i < lines.count; i++) { NSView *v = lines[i]; NSRect f = v.frame; f.origin.y = H - pad - 44 - ys[i].doubleValue - f.size.height; v.frame = f; [panel addSubview:v]; }
+    foot.frame = NSMakeRect(pad, pad - 4, W - 2 * pad, 18); [panel addSubview:foot];
+    [g_menu addSubview:panel];
+}
+static void menu_move(int d) {   // the next line with a value or an action
+    if (!g_rows.count) return;
+    for (int k = 0; k < (int)g_rows.count; k++) { g_sel = (g_sel + d + (int)g_rows.count) % (int)g_rows.count; if (g_rows[g_sel].choices || g_rows[g_sel].act) break; }
+    menu_draw();
+}
+static void menu_change(int d) {   // d: +1 / -1 a value, 0 = A / Return (the next value, or the line's action)
+    DmMenuRow *r = g_rows[g_sel];
+    if (r.act) { if (d == 0 && !([r.title isEqualToString:@"Restart to apply"] && !menu_pending())) r.act(); return; }
+    int n = (int)r.choices.count, v = r.get(); r.set(((v + (d < 0 ? -1 : 1)) % n + n) % n);
+    menu_draw();
+}
+static void menu_open(void) {
+    if (g_menu_open || !g_win) return;
+    g_btn = 0; g_w = g_a = g_s = g_d = 0; push();   // nothing the game was given stays pressed
+    if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
+    for (int p = 0; p < DM_PLAYERS; p++) dm_pad_set_player(p, 0, 0, 0, 0, 0);
+    g_menu_open = 1; menu_build();
+    if (g_sel >= (int)g_rows.count || !(g_rows[g_sel].choices || g_rows[g_sel].act)) { g_sel = 0; if (!g_rows[0].choices) menu_move(1); }
+    NSView *cv = g_win.contentView;
+    g_menu = [[NSView alloc] initWithFrame:cv.bounds]; g_menu.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    g_menu.wantsLayer = YES; g_menu.layer.backgroundColor = [NSColor colorWithWhite:0 alpha:0.45].CGColor;
+    [cv addSubview:g_menu]; menu_draw();
+    dm_focus_set(2); LOG("in-game menu: open");
+}
+static void menu_close(void) {
+    if (!g_menu_open) return;
+    g_menu_open = 0; g_menu_swallow = 1; [g_menu removeFromSuperview]; g_menu = nil;
+    if (g_win.isKeyWindow) { dm_focus_set(1); input_resume(); }
+    LOG("in-game menu: closed");
+}
+static void menu_toggle(void) { if (g_menu_open) menu_close(); else menu_open(); }
+static void menu_home(void) {   // Home from GameController or from the Pro Controller's reports, whichever comes first: one press toggles once
+    static uint64_t last; uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (now - last > 300000000ull) menu_toggle();
+    last = now;
+}
+// A controller while the panel is up: each button and the stick act on their press (edge), not while held
+static void menu_pad(uint64_t m, int32_t ly) {
+    static uint64_t prev; static int prev_y;
+    uint64_t dn = m & ~prev; prev = m;
+    int y = ly > DM_STICK_MAX / 2 ? 1 : ly < -DM_STICK_MAX / 2 ? -1 : 0, ydn = y != prev_y ? y : 0; prev_y = y;
+    if ((dn & DM_BTN_UP) || ydn > 0) menu_move(-1);
+    if ((dn & DM_BTN_DOWN) || ydn < 0) menu_move(1);
+    if (dn & DM_BTN_LEFT) menu_change(-1);
+    if (dn & DM_BTN_RIGHT) menu_change(1);
+    if (dn & DM_BTN_A) menu_change(0);
+    if (dn & DM_BTN_B) menu_close();
+}
+static int menu_key(unsigned short c, int down) {   // 1 = the menu took the key
+    if (c == 53) { if (down) menu_toggle(); return 1; }   // Escape
+    if (!g_menu_open) return 0;
+    if (down) switch (c) { case 126: menu_move(-1); break; case 125: menu_move(1); break; case 123: menu_change(-1); break; case 124: menu_change(1); break; case 36: case 49: case 76: menu_change(0); break; }
     return 1;
 }

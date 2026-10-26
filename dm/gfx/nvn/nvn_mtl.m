@@ -418,7 +418,7 @@ void mtl_init(void) {
     g_present_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_present_args) MDIE("failed to create the present argument table: %s", ate.localizedDescription.UTF8String);
     for (int i = 0; i < 3; i++) {
-        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 12 options:MTLResourceStorageModeShared];
         if (!g_present_uv[i]) MDIE("failed to create present UV buffer[%d]", i);
         res_add(g_present_uv[i]);
     }
@@ -9867,14 +9867,27 @@ int mtl_display_hz(void) {
 static _Atomic uint64_t g_present_stall_ns;   // For unit tests: an extra pause before each present on the present thread (simulating a drawable that stays unavailable)
 static CAMetalLayer *g_present_layer_resident;
 void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
+// Auto HDR (the Mac in-game menu, front_mac.m): the games are SDR; with a peak above 1 the window's layer takes extended linear values (RGBA16Float, extended linear sRGB)
+// and the present's last pass turns the picture to linear light and lifts only its brightest parts, smoothly from the knee to the peak at full white, into the screen's
+// headroom (EDR: SDR white stays 1.0; macOS clips to what the screen can show). Captures and other non-float targets stay SDR
+static _Atomic float g_hdr_peak = 0, g_hdr_knee = 0.55f;
+void mtl_hdr_set(float peak) { g_hdr_peak = peak; MLOG("Auto HDR: %s", peak > 1 ? [NSString stringWithFormat:@"highlights up to %.1fx SDR white", peak].UTF8String : "off"); }
+static void hdr_consts(float *h, MTLPixelFormat dst) { float pk = g_hdr_peak; int on = pk > 1 && dst == MTLPixelFormatRGBA16Float; h[0] = on; h[1] = on ? pk : 1; h[2] = g_hdr_knee; h[3] = 0; }
 static void present_pipeline(MTLPixelFormat format) {
     if (!g_blit_pso || g_blit_fmt != format) {
         static const char *src_msl =
             "#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
             "vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
-            "struct Crop { float4 rect; float4 edge; };\n"
-            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); }\n";
+            "struct Crop { float4 rect; float4 edge; float4 hdr; };\n"
+            // hdr (Auto HDR, mtl_hdr_set): x = 1 when the drawable takes extended linear values, y = the peak for full white (times SDR white), z = the luminance where the boost starts
+            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {\n"
+            "  float4 o = t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw));\n"
+            "  if (c.hdr.x == 0) return o;\n"
+            "  float3 v = saturate(o.rgb), lin = select(pow((v + 0.055) / 1.055, 2.4), v / 12.92, v <= 0.04045);\n"
+            "  float L = dot(lin, float3(0.2126, 0.7152, 0.0722)), w = smoothstep(c.hdr.z, 1.0, L);\n"
+            "  return float4(lin * mix(1.0, c.hdr.y, w * w), 1);\n"
+            "}\n";
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
         if (!lib) MDIE("present shader compile failed %s", e.localizedDescription.UTF8String);
@@ -9946,9 +9959,10 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setViewport:vp];
     [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
-    float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
+    float uv[12] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
+    hdr_consts(uv + 8, dst.pixelFormat);
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [en endEncoding];
@@ -9973,6 +9987,9 @@ static int fx_mode(void) {
     MLOG("present upscaling (DM_PRESENT_UPSCALE): %s", v ? "metalfx, MetalFX's spatial scaler where the picture is shown larger than the game renders it" : "off, bilinear");
     return g_fx_mode = v;
 }
+// The Mac in-game menu (front_mac.m) switches MetalFX while the game runs: the present reads the mode on every frame, and a scaler made earlier stays for when it comes back on
+int mtl_upscale_get(void) { return fx_mode(); }
+int mtl_upscale_set(int on) { fx_mode(); g_fx_mode = on && g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]; MLOG("present upscaling: %s (in-game menu)", g_fx_mode ? "metalfx" : "off, bilinear"); return g_fx_mode; }
 // MetalFX scales the content (cw x ch) to its rectangle on the canvas (vp) when the rectangle is at least as large in both directions and larger in one
 static int fx_wanted(MTLViewport vp, NSUInteger cw, NSUInteger ch) {
     NSUInteger w = (NSUInteger)vp.width, h = (NSUInteger)vp.height;
@@ -10045,6 +10062,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     float *uv = uvb.contents; NSUInteger tw = tex.width, th = tex.height, cx = r[0], cy = r[1], cw = r[2], ch = r[3];
     uv[0] = (float)cx / tw; uv[1] = (float)cy / th; uv[2] = (float)cw / tw; uv[3] = (float)ch / th;
     uv[4] = (cx + 0.5f) / tw; uv[5] = (cy + 0.5f) / th; uv[6] = (cx + cw - 0.5f) / tw; uv[7] = (cy + ch - 0.5f) / th;
+    hdr_consts(uv + 8, dst.pixelFormat);
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [g_present_args setAddress:uvb.gpuAddress atIndex:0];
     [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
@@ -10056,7 +10074,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
 // returns whether it was submitted. Completion reports the encoding kind, or PRESENT_FAILED on a GPU error. Resources remain resident and retained until GPU completion.
 static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int)) {
     id<MTL4CommandAllocator> al = [g_dev newCommandAllocator]; id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
-    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 12 options:MTLResourceStorageModeShared];
     if (!al || !cb || !uvb) { MLOG("[RED] offscreen present: no command allocator or buffer"); return 0; }
     id<MTLTexture> raw = present_raw_src(src);
     fx_state fx = {0};

@@ -10,6 +10,9 @@
 #include <mach-o/ldsyms.h>
 #include "hle.h"
 
+static char g_code_dir[1024];   // load_modules' folder (dm_code_dir: the Mac in-game menu reads the mods records there)
+const char *dm_code_dir(void) { return g_code_dir; }
+
 module_t g_mod[MAX_MOD];
 int g_nmod;
 // Stable module addresses live in g_mod; lookup order follows activation, including unload/reload.
@@ -532,6 +535,34 @@ static uint8_t *slurp(const char *path, size_t *n) {
     close(fd); *n = st.st_size; return p;
 }
 
+// Mods switched off (the Mac in-game menu, front_mac.m): a module's pchtxt mods are written into <name>.patched.bin when the game is built (patch_nso.py) or afterwards
+// (switchports/apply_pchtxt.py), and each patch is listed in <name>.mods.tsv with the bytes it replaced (offset, original, mod, file, comment). DM_MODS_OFF names mod files
+// (their base names, separated by |) whose patches get their original bytes back here, between the copy and the sealing of the pages, so a mod is switched without
+// changing the app. A patch whose bytes are no longer the mod's (the rewriter changed that instruction after a build-time mod) is left as it is and reported
+static int mods_off_has(const char *off, const char *file) {
+    const char *b = strrchr(file, '/'); b = b ? b + 1 : file; size_t n = strlen(b);
+    for (const char *s = off; *s; ) { const char *e = strchr(s, '|'); size_t k = e ? (size_t)(e - s) : strlen(s); if (k == n && !strncmp(s, b, n)) return 1; s += k + (e != NULL); }
+    return 0;
+}
+static void mods_off_apply(module_t *m, const char *dir) {
+    const char *off = getenv("DM_MODS_OFF"); if (!off || !*off) return;
+    char path[1024]; snprintf(path, sizeof path, "%s/%s.mods.tsv", dir, m->name);
+    FILE *f = fopen(path, "r"); if (!f) return;
+    char line[4096]; int undone = 0, kept = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        char *col[5] = {0}; int nc = 0; for (char *t = line, *sv; nc < 5 && (t = strtok_r(nc ? NULL : t, "\t\n", &sv)); nc++) col[nc] = t;
+        if (nc < 4 || !mods_off_has(off, col[3])) continue;
+        uint64_t o = strtoull(col[0], NULL, 16); size_t ln = strlen(col[1]) / 2; uint8_t orig[512], mod[512];
+        if (!ln || ln > sizeof orig || strlen(col[2]) != 2 * ln || o + ln > m->size) { kept++; continue; }
+        for (size_t i = 0; i < ln; i++) { sscanf(col[1] + 2 * i, "%2hhx", &orig[i]); sscanf(col[2] + 2 * i, "%2hhx", &mod[i]); }
+        if (memcmp(m->base + o, mod, ln)) { kept++; continue; }
+        memcpy(m->base + o, orig, ln); undone++;
+    }
+    fclose(f);
+    if (undone || kept) LOG("%s: mods switched off (DM_MODS_OFF): %d patches back to the original bytes%s", m->name, undone, kept ? ", some left as built (their bytes are no longer the mod's)" : "");
+}
+
 // Seal the code area immediately after copying into anonymous pages (16 KB pages): [0, text_end) and the patch area are read-only+execute, and from then on any write to the code area crashes on the spot;
 // what lies between (ro and data on the same page can only go together) is writable
 static void map_image(module_t *m, const char *dir) {
@@ -546,7 +577,7 @@ static void map_image(module_t *m, const char *dir) {
         uint8_t *a = mmap(NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
-        memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl); free(raw); install_key_page(m);
+        memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl); free(raw); install_key_page(m); mods_off_apply(m, dir);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
@@ -556,7 +587,7 @@ static void map_image(module_t *m, const char *dir) {
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
-    memcpy(m->base, raw, sz); free(raw); install_key_page(m);
+    memcpy(m->base, raw, sz); free(raw); install_key_page(m); mods_off_apply(m, dir);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;
@@ -565,6 +596,7 @@ static void map_image(module_t *m, const char *dir) {
 #endif
 
 void load_modules(const char *dir, const char **names, int n) {
+    strlcpy(g_code_dir, dir, sizeof g_code_dir);
     // Map everything and parse the symbol tables first, then relocate all at once (cross-module symbols must all be in place first)
     // DM_BOOTPROF: breakdown of ① host loading (milliseconds), to set the upper bound for ③ pre-relocation / mmap
     uint64_t t0 = now_ns(), tm = 0, tp = 0, tg = 0, tr = 0, t;
