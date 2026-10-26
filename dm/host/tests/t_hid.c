@@ -206,12 +206,37 @@ static void t_rumble_log(void) {
     unsetenv("DM_RUMBLE_LOG");
 }
 
+// A controller's own motion (dm_pad_set_motion, front_mac.m): player 1's six-axis sensor reports it instead of lying flat, integrates the angle and the direction,
+// supplies gravity from the direction when the controller sends rotation only, and lies flat again once the controller's motion is gone
+static void t_motion(void) {
+    g_mode = 1; ids((const uint32_t[]){0, 1, 2, 3, 4, 5, 6, 7, NPAD_HANDHELD}, 9);
+    uint32_t h = 0; h_hid_SixHandles(&h, 1, &(uint32_t){0}, STYLE_FULLKEY);
+    SixAxisState s[3];
+    h_hid_SixState(s, &h);
+    CHECK(s[0].acc[2] == -1 && s[0].gyro[2] == 0 && h_hid_SixRest(&h), "without motion the sensor lies flat and at rest");
+    const float flat[3] = {0, 0, -1}, turn[3] = {0, 0, 0.25f}, none[3] = {0, 0, 0};
+    dm_pad_set_motion(0, flat, turn, 5000000000ull);
+    dm_pad_set_motion(0, flat, turn, 5100000000ull);   // 100 ms at a quarter turn per second about z: 0.025 of a turn, 9 degrees
+    CHECK(six_states(s, 3, h) == 3, "three history entries");
+    CHECK(s[0].gyro[2] == 0.25f && fabsf(s[0].angle[2] - 0.025f) < 1e-4f, "angular velocity and the integrated angle");
+    CHECK(fabsf(s[1].angle[2] - (0.025f - 0.25f * 0.005f)) < 1e-4f, "an older entry's angle is stepped back by 5 ms");
+    CHECK(fabsf(s[0].dir[0] - cosf(2 * (float)M_PI * 0.025f)) < 1e-4f && fabsf(s[0].dir[1] - sinf(2 * (float)M_PI * 0.025f)) < 1e-4f, "the direction turned 9 degrees about z");
+    CHECK(!h_hid_SixRest(&h), "a turning controller is not at rest");
+    dm_pad_set_motion(0, none, none, 5110000000ull);
+    h_hid_SixState(s, &h);
+    CHECK(fabsf(s[0].acc[2] + 1) < 1e-4f && fabsf(s[0].acc[0]) < 1e-4f, "rotation only: gravity from the direction");
+    dm_pad_motion_gone(0);
+    h_hid_SixState(s, &h);
+    CHECK(s[0].acc[2] == -1 && s[0].angle[2] == 0 && h_hid_SixRest(&h), "flat again once the controller's motion is gone");
+}
+
 int main(void) {
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     t_slots();
     t_npads();
     t_vibration();
     t_rumble_log();
+    t_motion();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

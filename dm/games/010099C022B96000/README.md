@@ -50,7 +50,7 @@ Update 1.3.1 (v327680) over the base game, SDK 18.3.5. The Wii game (codename Co
 
 ## Input
 
-- Docked, Galaxy's pointer is the Joy-Con gyro, which the host does not have; handheld, it is the touch screen. `op_mode handheld` starts it in handheld mode (720p).
+- Docked, Galaxy's pointer is the controller's gyro; handheld, it is the touch screen. `op_mode handheld` starts it in handheld mode (720p). On the Mac a Switch Pro Controller's gyro drives the docked pointer (its HID reports, `front_mac.m`; tested on 1.3.1 with `DM_OPMODE=1`); without one, handheld mode's touch screen (the mouse) is the pointer.
 - On the iPhone, touches no gamepad control takes go to the game's touch screen: in the 3D layout, those outside the right third of the screen, which is the right stick; all of them while a controller is connected. On the Mac the mouse is a finger, and `DM_KEYS` taps with `T<x>x<y>` (normalized picture coordinates).
 
 ## Services

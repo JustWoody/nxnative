@@ -9,6 +9,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <GameController/GameController.h>
+#import <IOKit/hid/IOHIDManager.h>
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
@@ -130,6 +131,58 @@ static void pad_read(GCExtendedGamepad *g) {
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
+// Motion: a controller with sensors (a Switch Pro Controller, a DualSense) feeds its player's six-axis sensor (dm_pad_set_motion, hle_hid.c); Super Mario Galaxy's docked
+// pointer is the gyro. GameController's axes need not be the Switch's (x right, y away from the player, z up out of the face: lying flat, gravity (0, 0, -1)):
+// DM_GYRO_AXES maps them, the GameController axis for the Switch's x, y and z, each with an optional minus (default x,y,z); DM_GYRO=0 keeps the sensor lying flat.
+static int g_gaxis[3] = {0, 1, 2}, g_gyro_state = -1;   // -1 not read yet, 0 off, 1 on
+static int g_pro_hid_live;   // a Pro Controller's own reports are being read (pro_report): its GCMotion is not used then
+static float g_gsign[3] = {1, 1, 1};
+static void gyro_init(void) {
+    const char *e = getenv("DM_GYRO"); g_gyro_state = !(e && !strcmp(e, "0"));
+    const char *a = getenv("DM_GYRO_AXES"); if (!a) return;
+    int ax[3], k = 0; float sg[3];
+    for (const char *s = a; *s && k < 3; s++) {
+        float sign = 1; if (*s == '-') { sign = -1; s++; }
+        if (*s < 'x' || *s > 'z') break;
+        sg[k] = sign; ax[k++] = *s - 'x';
+        while (s[1] && s[1] != ',') s++; if (s[1] == ',') s++;
+    }
+    if (k == 3) { memcpy(g_gaxis, ax, sizeof ax); memcpy(g_gsign, sg, sizeof sg); }
+    else LOG("[RED] DM_GYRO_AXES=%s: three of x y z expected (such as -y,x,z), keeping x,y,z", a);
+}
+static void motion_on(GCController *c) {
+    if (g_gyro_state < 0) gyro_init();
+    GCMotion *mo = c.motion;
+    if (!g_gyro_state || !mo || !mo.hasRotationRate) return;
+    if (mo.sensorsRequireManualActivation) mo.sensorsActive = YES;
+    LOG("controller '%s': motion sensors on (axes %s%c,%s%c,%s%c; DM_GYRO_AXES remaps them)", pad_name(c), g_gsign[0] < 0 ? "-" : "", 'x' + g_gaxis[0],
+        g_gsign[1] < 0 ? "-" : "", 'x' + g_gaxis[1], g_gsign[2] < 0 ? "-" : "", 'x' + g_gaxis[2]);
+    __weak GCController *wc = c;
+    mo.valueChangedHandler = ^(GCMotion *m) {
+        GCController *cc = wc; if (!cc || !g_input_on) return;
+        if (g_pro_hid_live && [cc.productCategory rangeOfString:@"Pro Controller"].location != NSNotFound) return;
+        int p = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)cc); if (p < 0) return;
+        double a[3], w[3];
+        if (m.hasGravityAndUserAcceleration) { a[0] = m.gravity.x + m.userAcceleration.x; a[1] = m.gravity.y + m.userAcceleration.y; a[2] = m.gravity.z + m.userAcceleration.z; }
+        else { a[0] = m.acceleration.x; a[1] = m.acceleration.y; a[2] = m.acceleration.z; }
+        w[0] = m.rotationRate.x; w[1] = m.rotationRate.y; w[2] = m.rotationRate.z;   // radians / s
+        // GameController sends a Switch Pro Controller's motion events with every value zero (macOS 27: active, 60 per second, still zero while it turns), so a player's
+        // sensor switches to real motion only from the first reading with data; until then games keep the flat sensor (and its shake) exactly as before
+        static int live[DM_PLAYERS];
+        if (!live[p]) {
+            if (fabs(a[0]) + fabs(a[1]) + fabs(a[2]) + fabs(w[0]) + fabs(w[1]) + fabs(w[2]) < 1e-6) return;
+            live[p] = 1; LOG("controller '%s': motion data arriving", pad_name(cc));
+        }
+        float acc[3], gyro[3];
+        for (int i = 0; i < 3; i++) { acc[i] = g_gsign[i] * (float)a[g_gaxis[i]]; gyro[i] = g_gsign[i] * (float)(w[g_gaxis[i]] / (2 * M_PI)); }
+        static int n, every = -1; if (every < 0) { const char *e = getenv("DM_GYRO_LOG"); every = e ? atoi(e) : 0; }   // DM_GYRO_LOG=<n>: every n-th reading, for DM_GYRO_AXES
+        if (every > 0 && ++n % every == 0)
+            LOG("controller motion #%d: active %d (manual %d), gravity+user %d, attitude %d; acceleration (%.2f, %.2f, %.2f), gravity (%.2f, %.2f, %.2f), raw acceleration (%.2f, %.2f, %.2f) G, "
+                "rotation (%.2f, %.2f, %.2f) rad/s → Switch acceleration (%.2f, %.2f, %.2f)", n, m.sensorsActive, m.sensorsRequireManualActivation, m.hasGravityAndUserAcceleration,
+                m.hasAttitude, a[0], a[1], a[2], m.gravity.x, m.gravity.y, m.gravity.z, m.acceleration.x, m.acceleration.y, m.acceleration.z, w[0], w[1], w[2], acc[0], acc[1], acc[2]);
+        dm_pad_set_motion(p, acc, gyro, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    };
+}
 // Called at start and on every connect / disconnect (gone: the controller that was just removed, nil on a connect)
 static void pads_changed(GCController *gone) {
     if (g_merge) {
@@ -145,6 +198,7 @@ static void pads_changed(GCController *gone) {
     for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p] && (g_held[p] == gone || ![now containsObject:g_held[p]])) {
         npad_name(p, nb, sizeof nb); LOG("controller '%s' disconnected: player %d (npad %s) is free", pad_name(g_held[p]), p + 1, nb);
         g_held[p].extendedGamepad.valueChangedHandler = nil;
+        g_held[p].motion.valueChangedHandler = nil; dm_pad_motion_gone(p);
         dm_haptics_apple_controller(p, nil);
         pad_slot_free(&g_slots, (__bridge const void *)g_held[p]); g_held[p] = nil;
         dm_pad_set_player(p, 0, 0, 0, 0, 0);   // nothing stays pressed
@@ -155,6 +209,7 @@ static void pads_changed(GCController *gone) {
         g_held[p] = c;
         c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
         npad_name(p, nb, sizeof nb); LOG("controller '%s' connected: player %d (npad %s)", pad_name(c), p + 1, nb);
+        motion_on(c);
         pad_read(c.extendedGamepad);
     }
     dm_pad_players(pad_slot_mask(&g_slots));
@@ -175,6 +230,68 @@ static void input_resume(void) {
     if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) pad_read(c.extendedGamepad); }
     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) pad_read(g_held[p].extendedGamepad);
 }
+// A Switch Pro Controller's motion, read from its HID reports: GameController gives its GCMotion all zeros, but macOS's own driver keeps the controller in the
+// full report mode (0x30, about 60 per second on Bluetooth) with its IMU on, and IOKit lets the host read those reports beside it without sending anything.
+// Each 0x30 report holds three samples 5 ms apart from byte 13: accelerometer x y z and gyroscope x y z, int16 little endian, in the controller's own axes
+// (x towards the shoulder buttons, y to the left, z up out of the face; lying flat the accelerometer reads +1 G on z). Measured on a Pro Controller on macOS 27:
+// turning it flat on the desk turns about z, tilting the front up turns about y while the x reading swings with gravity, rolling it turns about x.
+// The Switch's SixAxisSensorState axes are x right, y away from the player, z up, with gravity (0, 0, -1) lying flat (hle_hid.c): acceleration (raw y, -raw x, -raw z),
+// angular velocity (-raw y, raw x, raw z). Scales: ±8 G (4096 per G) and ±2000 degrees / s (0.061 per unit). The gyroscope's resting offset is followed while it is still.
+// DM_GYRO_AXES (motion_on) reorders and flips the result; DM_GYRO=0 or DM_GYRO_HID=0 turns this reader off.
+static IOHIDManagerRef g_hid;
+static double g_gbias[3]; static int g_gbias_n;
+static int pro_player(void) {   // the player of the first Pro Controller GameController knows, else player 1
+    if (g_merge) return 0;
+    for (GCController *c in GCController.controllers)
+        if ([c.productCategory rangeOfString:@"Pro Controller"].location != NSNotFound) { int p = pad_slot_of(&g_slots, (__bridge const void *)c); if (p >= 0) return p; }
+    return 0;
+}
+static void pro_report(void *ctx, IOReturn res, void *sender, IOHIDReportType type, uint32_t id, uint8_t *r, CFIndex len) {
+    (void)ctx; (void)res; (void)sender; (void)type; (void)id;
+    if (!g_input_on || len < 49 || r[0] != 0x30) return;
+    static int first = 1;
+    if (first) { first = 0; g_pro_hid_live = 1; LOG("controller motion: reading the Pro Controller's own reports (HID 0x30)"); }
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int p = pro_player();
+    for (int k = 0; k < 3; k++) {
+        const uint8_t *s = r + 13 + 12 * k;
+        int16_t v[6]; for (int i = 0; i < 6; i++) v[i] = (int16_t)(s[2 * i] | s[2 * i + 1] << 8);
+        double g[3] = {v[3], v[4], v[5]};
+        if (fabs(g[0]) < 40 && fabs(g[1]) < 40 && fabs(g[2]) < 40) {   // still (under ~2.5 degrees / s): follow the resting offset
+            double a = g_gbias_n < 200 ? 1.0 / ++g_gbias_n : 0.005;
+            for (int i = 0; i < 3; i++) g_gbias[i] += (g[i] - g_gbias[i]) * a;
+        }
+        for (int i = 0; i < 3; i++) g[i] -= g_gbias[i];
+        double dps = 0.06103 / 360;   // raw units to revolutions / s
+        float accs[3] = {(float)(v[1] / 4096.0), (float)(-v[0] / 4096.0), (float)(-v[2] / 4096.0)};
+        float gyros[3] = {(float)(-g[1] * dps), (float)(g[0] * dps), (float)(g[2] * dps)}, acc[3], gyro[3];
+        for (int i = 0; i < 3; i++) { acc[i] = g_gsign[i] * accs[g_gaxis[i]]; gyro[i] = g_gsign[i] * gyros[g_gaxis[i]]; }
+        dm_pad_set_motion(p, acc, gyro, now - (uint64_t)(2 - k) * 5000000);
+    }
+    static int n; static int every = -1; if (every < 0) { const char *e = getenv("DM_GYRO_LOG"); every = e ? atoi(e) : 0; }
+    if (every > 0 && ++n % every == 0) {
+        const uint8_t *s = r + 13; int16_t v[6]; for (int i = 0; i < 6; i++) v[i] = (int16_t)(s[2 * i] | s[2 * i + 1] << 8);
+        LOG("controller motion (HID) #%d: raw accel %d %d %d gyro %d %d %d, gyro offset %.0f %.0f %.0f", n, v[0], v[1], v[2], v[3], v[4], v[5], g_gbias[0], g_gbias[1], g_gbias[2]);
+    }
+}
+static void pro_found(void *ctx, IOReturn res, void *sender, IOHIDDeviceRef d) {   // a Pro Controller appeared (at start or later): listen to its reports
+    (void)ctx; (void)res; (void)sender;
+    static uint8_t buf[512];   // one controller is read; a second one's reports would share it (the callback copies nothing out of it later)
+    IOHIDDeviceRegisterInputReportCallback(d, buf, sizeof buf, pro_report, NULL);
+    id t = (__bridge id)IOHIDDeviceGetProperty(d, CFSTR(kIOHIDTransportKey));
+    LOG("controller motion: Pro Controller found over HID (%s)", t ? [t description].UTF8String : "?");
+}
+static void pro_hid_start(void) {
+    if (g_gyro_state < 0) gyro_init();
+    const char *e = getenv("DM_GYRO_HID");
+    if (!g_gyro_state || (e && !strcmp(e, "0"))) return;
+    g_hid = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    IOHIDManagerSetDeviceMatching(g_hid, (__bridge CFDictionaryRef)@{@kIOHIDVendorIDKey: @0x057E, @kIOHIDProductIDKey: @0x2009});
+    IOHIDManagerRegisterDeviceMatchingCallback(g_hid, pro_found, NULL);
+    IOHIDManagerScheduleWithRunLoop(g_hid, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    IOReturn r = IOHIDManagerOpen(g_hid, kIOHIDOptionsTypeNone);
+    if (r != kIOReturnSuccess) LOG("[RED] controller motion: cannot open HID devices (0x%x%s); the Pro Controller's sensors stay off", r, r == kIOReturnNotPermitted ? ", not permitted" : "");
+}
 static void pads_start(void) {
     const char *e = getenv("DM_PAD_MERGE"); g_merge = e && atoi(e);
     e = getenv("DM_KBD_PLAYER"); g_kbd_own = !g_merge && e && !strcmp(e, "own");
@@ -183,6 +300,7 @@ static void pads_start(void) {
     LOG("front end: %s", g_merge ? "every controller is player 1 (DM_PAD_MERGE)" : g_kbd_own ? "the keyboard is player 1, each controller a player of its own from player 2 on (DM_KBD_PLAYER=own)"
                                                                            : "each controller is a player of its own, the keyboard plays with player 1");
     pads_changed(nil);
+    pro_hid_start();
 }
 
 // Mouse as a single-point touchscreen (front.h dm_touch_set): left button down / drag = finger 0, release = lifted. The content view takes the clicks,
