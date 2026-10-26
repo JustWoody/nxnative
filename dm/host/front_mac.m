@@ -530,7 +530,9 @@ static void hdr_apply(int lvl) {
 @end
 @implementation DmMenuRow @end
 static NSMutableArray<DmMenuRow *> *g_rows;
-static NSView *g_menu; static int g_sel;
+static NSView *g_menu; static int g_sel, g_tab;   // the chosen line; the tab (sections in order, from menu_tabs)
+static NSArray<NSString *> *menu_tabs(void);
+static int menu_shows(DmMenuRow *r) { NSArray *t = menu_tabs(); return !r.section.length || (g_tab < (int)t.count && [r.section isEqualToString:t[g_tab]]); }
 static int g_restart_opmode = -1; static NSMutableOrderedSet<NSString *> *g_mods_all, *g_mods_off;
 
 // settings.env: KEY=value lines (a # comments a line out). A key the menu sets replaces its uncommented line, or is added at the end; nil removes the uncommented line
@@ -574,6 +576,11 @@ static NSString *mod_label(NSString *file) {   // "Fl4sh9174 1920x1080 1.3.0-1.4
 static DmMenuRow *row(NSString *section, NSString *title, NSArray<NSString *> *choices, int (^get)(void), void (^set)(int)) {
     DmMenuRow *r = [DmMenuRow new]; r.section = section; r.title = title; r.choices = choices; r.get = get; r.set = set; [g_rows addObject:r]; return r;
 }
+static NSArray<NSString *> *menu_tabs(void) {   // the sections that have lines, in order: each is a tab (L / R or Q / E switch them)
+    NSMutableOrderedSet<NSString *> *t = [NSMutableOrderedSet new];
+    for (DmMenuRow *r in g_rows) if (r.section.length) [t addObject:r.section];
+    return t.array;
+}
 static int menu_pending(void) { for (DmMenuRow *r in g_rows) if (r.restart && r.get && r.get() != r.initial) return 1; return 0; }
 static void menu_close(void);
 static void menu_restart(void) {   // starts the app again a moment after this process has gone (open -n), then quits
@@ -583,6 +590,42 @@ static void menu_restart(void) {   // starts the app again a moment after this p
     t.arguments = @[@"-c", @"sleep 1; exec /usr/bin/open -n \"$0\"", app];
     [t launchAndReturnError:nil];
     [NSApp terminate:nil];
+}
+// The game's own player settings (Resources/game/launcher.json, written by switchports/game_settings.py from nxnative's settings.tsv: the rows that apply to this game, as
+// the iOS launcher shows them). The host reads them as the game starts, so each takes a restart; the ones this menu changes live (console mode, upscaling, the HUD) are
+// left out. Frame rate gets 120 fps on a screen that shows 120 Hz: nxnative paces those games itself (fps_target), so the game keeps its speed; it also sets the 120 Hz link
+static NSArray *g_game_settings;
+static void menu_game_settings(NSString *section) {
+    if (!g_game_settings) {
+        const char *dir = dm_code_dir();
+        NSData *d = dir && *dir ? [NSData dataWithContentsOfFile:[[@(dir) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"launcher.json"]] : nil;
+        g_game_settings = d ? ([NSJSONSerialization JSONObjectWithData:d options:0 error:nil][@"settings"] ?: @[]) : @[];
+    }
+    static NSMutableDictionary<NSString *, NSNumber *> *pick; if (!pick) pick = [NSMutableDictionary new];   // the choice made in this session, kept across menu openings
+    for (NSDictionary *st in g_game_settings) {
+        NSString *env = st[@"env"], *kind = st[@"kind"], *def = [st[@"default"] description] ?: @"";
+        if (![st[@"section"] isEqualToString:section] || [@[@"DM_OPMODE", @"DM_PRESENT_UPSCALE", @"DM_METAL_HUD", @"DM_TOUCH_HAPTICS"] containsObject:env]) continue;
+        NSMutableArray<NSString *> *vals = [NSMutableArray new], *labels = [NSMutableArray new];
+        if ([kind isEqualToString:@"choice"]) for (NSArray *o in st[@"options"]) { [vals addObject:[o[0] description]]; [labels addObject:o[1]]; }
+        else if ([kind isEqualToString:@"toggle"]) { [vals addObject:[st[@"off"] description]]; [labels addObject:@"Off"]; [vals addObject:[st[@"on"] description]]; [labels addObject:@"On"]; }
+        else if ([kind isEqualToString:@"range"]) {
+            double lo = [st[@"min"] doubleValue], hi = [st[@"max"] doubleValue], step = [st[@"step"] doubleValue]; if (step <= 0) continue;
+            for (double v = lo; v <= hi + step / 2; v += step) { [vals addObject:[NSString stringWithFormat:@"%g", round(v * 1000) / 1000]]; [labels addObject:[NSString stringWithFormat:@"%.0f%%", v * 100]]; }
+        } else continue;
+        int fps = [env isEqualToString:@"DM_FPS_TARGET"];
+        if (fps && g_screen_fps >= 120 && ![vals containsObject:@"120"]) { [vals addObject:@"120"]; [labels addObject:@"120 fps"]; }
+        const char *cur = getenv(env.UTF8String); NSString *now = cur ? @(cur) : def;
+        int init = 0; double best = INFINITY;
+        for (int i = 0; i < (int)vals.count; i++) { double dd = fabs(vals[i].doubleValue - now.doubleValue); if ([vals[i] isEqualToString:now]) { best = -1; init = i; break; } if (dd < best) { best = dd; init = i; } }
+        if (!pick[env]) pick[env] = @(init);
+        NSString *label = st[@"label"];
+        DmMenuRow *r = row(section, label, labels, ^int { return pick[env].intValue; }, ^(int v) {
+            pick[env] = @(v); NSString *val = vals[v];
+            settings_put(env, [val isEqualToString:def] ? nil : val);
+            if (fps) { int hi = val.intValue > 60; settings_put(@"DM_PRESENT_HZ", hi ? val : nil); settings_put(@"DM_PRESENT_LINK", hi ? @"2" : nil); }
+        });
+        r.restart = 1; r.initial = init;
+    }
 }
 static void menu_build(void) {
     g_rows = [NSMutableArray new]; mods_read();
@@ -605,10 +648,12 @@ static void menu_build(void) {
         if (!v) { for (int p = 0; p < DM_PLAYERS; p++) dm_pad_motion_gone(p); }
         else { for (GCController *c in GCController.controllers) motion_on(c); if (!g_hid) pro_hid_start(); }
         settings_put(@"DM_GYRO", v ? nil : @"0"); });
+    menu_game_settings(@"Game");
     abxy_init();
     row(@"Controls", @"A B X Y buttons", @[@"Automatic", @"By label", @"By position"], ^int { return g_abxy < 0 ? 0 : g_abxy ? 1 : 2; }, ^(int v) {
         g_abxy = v == 0 ? -1 : v == 1 ? 1 : 0;
         settings_put(@"DM_PAD_ABXY", v == 0 ? nil : v == 1 ? @"label" : @"position"); });
+    menu_game_settings(@"Controls"); menu_game_settings(@"Performance");
     for (NSString *m in g_mods_all) {
         DmMenuRow *r = row(@"Mods", mod_label(m), onoff, ^int { return ![g_mods_off containsObject:m]; }, ^(int v) {
             if (v) [g_mods_off removeObject:m]; else [g_mods_off addObject:m];
@@ -628,14 +673,11 @@ static void menu_draw(void) {
     for (NSView *v in [g_menu.subviews copy]) [v removeFromSuperview];
     const CGFloat W = 520, rh = 30, pad = 22; int pending = menu_pending();
     NSMutableArray<NSView *> *lines = [NSMutableArray new]; NSString *sec = nil; CGFloat h = 0;
-    NSMutableArray<NSNumber *> *ys = [NSMutableArray new];
+    NSMutableArray<NSNumber *> *ys = [NSMutableArray new]; CGFloat sel_y = 0; static CGFloat scroll;
     for (NSUInteger i = 0; i < g_rows.count; i++) {
         DmMenuRow *r = g_rows[i];
-        if (r.section.length && ![r.section isEqualToString:sec ?: @""]) {
-            sec = r.section; h += 8;
-            NSTextField *t = menu_label(r.section.uppercaseString, 11, NSFontWeightSemibold, [NSColor colorWithWhite:0.55 alpha:1], NSTextAlignmentLeft);
-            t.frame = NSMakeRect(pad, 0, W - 2 * pad, 18); [lines addObject:t]; [ys addObject:@(h)]; h += 20;
-        } else if (!r.section.length && sec) { sec = nil; h += 14; }
+        if (!menu_shows(r)) continue;
+        if (!r.section.length && !sec) { sec = @""; h += 14; }   // the gap before Restart / Resume / Quit
         NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(10, 0, W - 20, rh)]; line.wantsLayer = YES; line.layer.cornerRadius = 6;
         int dim = r.act && [r.title isEqualToString:@"Restart to apply"] && !pending;
         if ((int)i == g_sel) line.layer.backgroundColor = [NSColor colorWithRed:0.18 green:0.42 blue:0.95 alpha:1].CGColor;
@@ -646,23 +688,49 @@ static void menu_draw(void) {
             int v = r.get(); NSString *val = v >= 0 && v < (int)r.choices.count ? r.choices[v] : @"?";
             NSTextField *vl = menu_label([NSString stringWithFormat:@"‹ %@ ›", val], 15, NSFontWeightMedium, fg, NSTextAlignmentRight); vl.frame = NSMakeRect(W - 220, 5, 186, 20); [line addSubview:vl];
         }
+        if ((int)i == g_sel) sel_y = h;
         [lines addObject:line]; [ys addObject:@(h)]; h += rh;
     }
     NSTextField *head = menu_label(@DM_GAME_NAME, 20, NSFontWeightSemibold, NSColor.whiteColor, NSTextAlignmentLeft);
-    NSTextField *foot = menu_label(pending ? @"↻ changes apply after a restart; progress not saved in the game is lost" : @"↻ needs a restart  ·  Esc or Home closes",
+    NSTextField *foot = menu_label(pending ? @"↻ changes apply after a restart; progress not saved in the game is lost" : @"↻ needs a restart  ·  L / R tabs  ·  Esc or Home closes",
                                    12, NSFontWeightRegular, [NSColor colorWithWhite:pending ? 0.85 : 0.55 alpha:1], NSTextAlignmentLeft);
-    CGFloat H = h + 44 + 40 + 2 * pad;
+    CGFloat H = h + 72 + 40 + 2 * pad, avail = g_menu.bounds.size.height - 40, view = h;
+    if (H > avail && avail > 200) {   // taller than the window: the lines scroll so the chosen one stays in view
+        view = avail - (72 + 40 + 2 * pad); H = avail;
+        if (sel_y < scroll) scroll = sel_y - 24; if (sel_y + rh > scroll + view) scroll = sel_y + rh - view + 8;
+        scroll = fmax(0, fmin(scroll, h - view));
+    } else scroll = 0;
     NSView *panel = [[NSView alloc] initWithFrame:NSMakeRect(floor((g_menu.bounds.size.width - W) / 2), floor((g_menu.bounds.size.height - H) / 2), W, H)];
     panel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
-    panel.wantsLayer = YES; panel.layer.backgroundColor = [NSColor colorWithWhite:0.11 alpha:0.97].CGColor; panel.layer.cornerRadius = 14;
+    panel.wantsLayer = YES; panel.layer.backgroundColor = [NSColor colorWithWhite:0.11 alpha:0.97].CGColor; panel.layer.cornerRadius = 14; panel.layer.masksToBounds = YES;
     head.frame = NSMakeRect(pad, H - pad - 28, W - 2 * pad, 28); [panel addSubview:head];
-    for (NSUInteger i = 0; i < lines.count; i++) { NSView *v = lines[i]; NSRect f = v.frame; f.origin.y = H - pad - 44 - ys[i].doubleValue - f.size.height; v.frame = f; [panel addSubview:v]; }
+    NSArray<NSString *> *tabs = menu_tabs(); CGFloat tx = pad;   // the tab bar, right of the title: L / R (Q / E) switch
+    NSTextField *hint = menu_label(@"L", 12, NSFontWeightBold, [NSColor colorWithWhite:0.5 alpha:1], NSTextAlignmentLeft); hint.frame = NSMakeRect(tx, H - pad - 52, 14, 18); [panel addSubview:hint]; tx += 18;
+    for (int i = 0; i < (int)tabs.count; i++) {
+        NSTextField *t = menu_label(tabs[i], 13, i == g_tab ? NSFontWeightSemibold : NSFontWeightRegular, i == g_tab ? NSColor.whiteColor : [NSColor colorWithWhite:0.55 alpha:1], NSTextAlignmentCenter);
+        CGFloat tw = ceil(t.intrinsicContentSize.width) + 16; t.frame = NSMakeRect(tx, H - pad - 52, tw, 18);
+        if (i == g_tab) { NSView *u = [[NSView alloc] initWithFrame:NSMakeRect(tx + 6, H - pad - 55, tw - 12, 2)]; u.wantsLayer = YES; u.layer.backgroundColor = [NSColor colorWithRed:0.18 green:0.42 blue:0.95 alpha:1].CGColor; [panel addSubview:u]; }
+        [panel addSubview:t]; tx += tw;
+    }
+    NSTextField *hint2 = menu_label(@"R", 12, NSFontWeightBold, [NSColor colorWithWhite:0.5 alpha:1], NSTextAlignmentLeft); hint2.frame = NSMakeRect(tx + 4, H - pad - 52, 14, 18); [panel addSubview:hint2];
+    for (NSUInteger i = 0; i < lines.count; i++) {
+        NSView *v = lines[i]; NSRect f = v.frame; CGFloat y = ys[i].doubleValue - scroll;
+        if (y < 0 || y + f.size.height > view) continue;   // scrolled out of the panel
+        f.origin.y = H - pad - 72 - y - f.size.height; v.frame = f; [panel addSubview:v];
+    }
     foot.frame = NSMakeRect(pad, pad - 4, W - 2 * pad, 18); [panel addSubview:foot];
     [g_menu addSubview:panel];
 }
 static void menu_move(int d) {   // the next line with a value or an action
     if (!g_rows.count) return;
-    for (int k = 0; k < (int)g_rows.count; k++) { g_sel = (g_sel + d + (int)g_rows.count) % (int)g_rows.count; if (g_rows[g_sel].choices || g_rows[g_sel].act) break; }
+    for (int k = 0; k < (int)g_rows.count; k++) { g_sel = (g_sel + d + (int)g_rows.count) % (int)g_rows.count; if ((g_rows[g_sel].choices || g_rows[g_sel].act) && menu_shows(g_rows[g_sel])) break; }
+    menu_draw();
+}
+static void menu_tab(int d) {   // the next / previous tab, on its first line
+    int n = (int)menu_tabs().count; if (n < 2) return;
+    g_tab = ((g_tab + d) % n + n) % n;
+    for (g_sel = 0; g_sel < (int)g_rows.count && !(menu_shows(g_rows[g_sel]) && g_rows[g_sel].section.length && (g_rows[g_sel].choices || g_rows[g_sel].act)); g_sel++) ;
+    if (g_sel >= (int)g_rows.count) g_sel = 0;
     menu_draw();
 }
 static void menu_change(int d) {   // d: +1 / -1 a value, 0 = A / Return (the next value, or the line's action)
@@ -677,7 +745,8 @@ static void menu_open(void) {
     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
     for (int p = 0; p < DM_PLAYERS; p++) dm_pad_set_player(p, 0, 0, 0, 0, 0);
     g_menu_open = 1; menu_build();
-    if (g_sel >= (int)g_rows.count || !(g_rows[g_sel].choices || g_rows[g_sel].act)) { g_sel = 0; if (!g_rows[0].choices) menu_move(1); }
+    if (g_tab >= (int)menu_tabs().count) g_tab = 0;
+    if (g_sel >= (int)g_rows.count || !(g_rows[g_sel].choices || g_rows[g_sel].act) || !menu_shows(g_rows[g_sel])) { g_sel = 0; if (!g_rows[0].choices || !menu_shows(g_rows[0])) menu_move(1); }
     NSView *cv = g_win.contentView;
     g_menu = [[NSView alloc] initWithFrame:cv.bounds]; g_menu.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     g_menu.wantsLayer = YES; g_menu.layer.backgroundColor = [NSColor colorWithWhite:0 alpha:0.45].CGColor;
@@ -707,10 +776,12 @@ static void menu_pad(uint64_t m, int32_t ly) {
     if (dn & DM_BTN_RIGHT) menu_change(1);
     if (dn & DM_BTN_A) menu_change(0);
     if (dn & DM_BTN_B) menu_close();
+    if (dn & DM_BTN_L) menu_tab(-1);
+    if (dn & DM_BTN_R) menu_tab(1);
 }
 static int menu_key(unsigned short c, int down) {   // 1 = the menu took the key
     if (c == 53) { if (down) menu_toggle(); return 1; }   // Escape
     if (!g_menu_open) return 0;
-    if (down) switch (c) { case 126: menu_move(-1); break; case 125: menu_move(1); break; case 123: menu_change(-1); break; case 124: menu_change(1); break; case 36: case 49: case 76: menu_change(0); break; }
+    if (down) switch (c) { case 126: menu_move(-1); break; case 125: menu_move(1); break; case 123: menu_change(-1); break; case 124: menu_change(1); break; case 36: case 49: case 76: menu_change(0); break; case 12: menu_tab(-1); break; case 14: case 48: menu_tab(1); break; }
     return 1;
 }
