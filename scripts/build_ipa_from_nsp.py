@@ -899,8 +899,10 @@ def patch_files(repo, exe_dir, mods, game_id=None):
     extra = [p for d in os.environ.get('DM_GAMES_DIR', '').split(os.pathsep) if d for p in sorted(Path(d).glob('*/patches.py'))]
     files = {}
     for p in [repo / 'dm/tools/sdk_patches.py'] + sorted((repo / 'dm/games').glob('*/patches.py')) + extra: files.setdefault(p.resolve(), p)
+    sys.path.insert(0, str(repo / 'dm/tools')); import pchtxt   # pchtxt mods of the modules' builds (switchports/mods, DM_PCHTXT): adding or removing one rewrites again
+    mods_pchtxt = [Path(p) for p in pchtxt.files() if pchtxt.build_of(open(p, encoding='utf-8', errors='replace').read()) in ids]
     return [p for p in files.values()
-            if p.parent.name == selected or any(i in p.read_text(errors='replace') for i in ids)]
+            if p.parent.name == selected or any(i in p.read_text(errors='replace') for i in ids)] + mods_pchtxt
 
 
 def collect_nros(py, repo, romfs, dst, env, logs):

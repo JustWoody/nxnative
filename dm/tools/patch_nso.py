@@ -103,6 +103,17 @@ for off, ob, nb, why in cuts:
     ob, nb = bytes.fromhex(ob), bytes.fromhex(nb)
     assert len(ob) == len(nb) and IMG[off:off + len(ob)] == ob, f'cut original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
     IMG[off:off + len(nb)] = nb
+# pchtxt mods of this build (pchtxt.py: DM_PCHTXT, else switchports/mods), after the profile's cuts: their bytes, listed in <name>.mods.tsv with their originals
+import pchtxt
+MOD_ROWS = []
+for path, rows in pchtxt.for_build(BUILD_ID):
+    for off, nb, why in rows:
+        assert 0 <= off and off + len(nb) <= len(IMG), f'pchtxt {path}: offset {off:#x} outside the image ({len(IMG):#x})'
+        MOD_ROWS.append(f'{off:#x}\t{bytes(IMG[off:off + len(nb)]).hex()}\t{nb.hex()}\t{os.path.basename(os.path.dirname(os.path.dirname(path)))}/{os.path.basename(path)}\t{why}')
+        IMG[off:off + len(nb)] = nb
+    print(f'pchtxt mod {path}: {len(rows)} patches')
+if MOD_ROWS:
+    with open(os.path.join(outdir, NAME + '.mods.tsv'), 'w') as f: f.write('# offset\toriginal\tmod\tfile\tcomment\n' + '\n'.join(MOD_ROWS) + '\n')
 # Key page indices are fixed; the key page content is written by the loader as "actual key number × 8".
 KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511}
 KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE'))}
