@@ -108,9 +108,27 @@ class Plan(unittest.TestCase):
         bases, rest, left = po.plan(self.d, CHAIN, pairs, False)
         self.assertEqual(bases, [('pull_bp', 'main0', 'fs_b', 'main0'), ('plain_b', 'main0', 'fs_b', 'main0')])
         self.assertEqual(rest, [('pull', 'fsc')])
-        self.assertEqual(left, {'reflection': 2, 'stage inputs': 1, 'library': 1, 'layer': 1, 'entry': 1})
+        self.assertEqual(left, {'reflection': 2, 'stage inputs': 1, 'library': 1, 'layer': 1, 'entry': 1, 'unlinkable (to the device)': 0})
         bases, _, _ = po.plan(self.d, CHAIN, pairs[:2], True)   # near = 0: the entry_z entries
         self.assertEqual(bases, [('pull_bp', 'main0_z', 'fs_b', 'main0'), ('plain_b', 'main0_z', 'fs_b', 'main0')])
+
+    def test_unlinkable_pairs_go_to_the_device(self):   # metal-tt cannot link a pixel shader reading a location its vertex shader does not write, or with another type
+        v = [('main0', False)]
+        def msl(key, struct, members):
+            (self.d / f'{key}_b.metal').write_text(f'struct {struct}\n{{\n' + ''.join(f'    {t} m_{n} [[user(locn{n})]];\n' for n, t in members) + '};\n')
+        self.shader('vs', {'vertex_inputs': []}, {'_b': v}); msl('vs', 'main0_out', [(0, 'float4')])
+        self.shader('ok', {}, {'_b': v}); msl('ok', 'main0_in', [(0, 'float4')])
+        self.shader('more', {}, {'_b': v}); msl('more', 'main0_in', [(0, 'float4'), (1, 'float4')])   # reads locn1, which vs does not write
+        self.shader('type', {}, {'_b': v}); msl('type', 'main0_in', [(0, 'float2')])                   # another type at locn0
+        self.shader('nosrc', {}, {'_b': v})                                                             # no MSL source: not checked
+        pairs = [('vs', 'ok'), ('vs', 'more'), ('vs', 'type'), ('vs', 'nosrc')]
+        bases, rest, left = po.plan(self.d, CHAIN, pairs, False)
+        self.assertEqual(bases, [('vs_b', 'main0', 'ok_b', 'main0'), ('vs_b', 'main0', 'nosrc_b', 'main0')])
+        self.assertEqual(rest, [('vs', 'more'), ('vs', 'type')])
+        self.assertEqual(left['unlinkable (to the device)'], 2)
+        bases, rest, _ = po.plan(self.d, CHAIN, pairs, False, frozenset({('vs', 'nosrc')}))   # --leave
+        self.assertEqual(bases, [('vs_b', 'main0', 'ok_b', 'main0')])
+        self.assertEqual(rest, [('vs', 'more'), ('vs', 'type'), ('vs', 'nosrc')])
 
     def test_script(self):
         j = po.script(self.d, [('v_bp', 'main0', 'f_b', 'main0'), ('w_bp', 'main0_z', 'f_b', 'main0')])

@@ -23,7 +23,7 @@
 #   --gpu: architectures, with or without the applegpu_ prefix (default g18p); --depth: the game's NVN depth mode (gl = near -w, NVN's default; zero = near 0, which the game sets
 #   with nvnDeviceSetDepthMode: the host knows it only at run time, so the profile says it; a wrong one costs the device its own prebuild, as without the archive);
 #   --os-min: the archives' minimum OS (default: the SDK's major version, e.g. 27.0; a device on an older system cannot open them and builds the bases itself)
-import argparse, hashlib, json, os, shutil, struct, subprocess, sys, time
+import argparse, re, hashlib, json, os, shutil, struct, subprocess, sys, time
 from pathlib import Path
 
 LAYER = b'render_target_array_index'
@@ -81,8 +81,21 @@ def functions(path):
     return dict(zip(names, consts))
 
 
-def plan(lib_dir, chain, pairs, zero):
-    """The bases the archive holds: [(vertex library, vertex entry, pixel library, pixel entry)], the pairs left to the device (function constants), and counts of the pairs left out"""
+def stage_io(lib_dir, key, struct):
+    """{location: MSL type} of the [[user(locnN)]] members of a library's main0_out (vertex) or main0_in (fragment), read from its MSL source <key>_b.metal; None without the source"""
+    try: src = (Path(lib_dir) / f'{key}_b.metal').read_text(errors='replace')
+    except OSError: return None
+    m = re.search(r'struct ' + struct + r'\s*\{(.*?)\};', src, re.S)
+    return {int(n): t for t, n in re.findall(r'^\s*([\w:<>, ]+?)\s+\w+\s*\[\[user\(locn(\d+)\)', m.group(1), re.M)} if m else {}
+
+
+def plan(lib_dir, chain, pairs, zero, leave=frozenset()):
+    """The bases the archive holds: [(vertex library, vertex entry, pixel library, pixel entry)], the pairs left to the device (function constants, pairs metal-tt cannot link,
+    and the pairs in leave), and counts of the pairs left out.
+    A pair whose pixel shader reads a location its vertex shader does not write, or with another type, fails metal-tt's link, and one such base fails the whole archive:
+    Super Mario Bros. Wonder 1.2.1 has 11 (vertex 0a91af5bef8578e2 with four pixel shaders among them, 'Fragment input(s) user(locn1) mismatching vertex shader output type(s)
+    or not written by vertex shader'), the same 11 its own prebuild fails on the device. They are left to the device (rest_pairs.tsv), which fails them the same way and draws
+    them later, so the archive still holds every other base. The check reads the MSL sources beside the libraries (<key>_b.metal); leave adds pairs it does not see"""
     lib_dir = Path(lib_dir); js, fns, layer = {}, {}, {}
     def refl(key):
         if key not in js:
@@ -98,7 +111,9 @@ def plan(lib_dir, chain, pairs, zero):
         if lib not in layer: layer[lib] = LAYER in (lib_dir / f'{lib}.metallib').read_bytes()
         return layer[lib]
     bases, rest, seen, left = [], [], set(), dict.fromkeys(('reflection', 'stage inputs', 'library', 'layer', 'entry'), 0)
+    outs, ins, unlinked = {}, {}, 0
     for vk, fk in pairs:
+        if (vk, fk) in leave: rest.append((vk, fk)); continue
         vj, fj = refl(vk), refl(fk)
         if not vj or not fj or vj.get('chain') != chain or fj.get('chain') != chain: left['reflection'] += 1; continue
         ventry = vj['entry_z'] if zero and vj.get('entry_z') else vj.get('entry'); fentry = fj.get('entry') or 'main0'
@@ -109,9 +124,14 @@ def plan(lib_dir, chain, pairs, zero):
         if vf is None or ff is None: left['library'] += 1; continue
         if writes_layer(vl): left['layer'] += 1; continue
         if ventry not in vf or fentry not in ff: left['entry'] += 1; continue
+        if vk not in outs: outs[vk] = stage_io(lib_dir, vk, 'main0_out')
+        if fk not in ins: ins[fk] = stage_io(lib_dir, fk, 'main0_in')
+        if outs[vk] is not None and ins[fk] is not None and any(outs[vk].get(loc) != t for loc, t in ins[fk].items()):
+            rest.append((vk, fk)); unlinked += 1; continue
         if vf[ventry] or ff[fentry]: rest.append((vk, fk)); continue
         b = (vl, ventry, fl, fentry)
         if b not in seen: seen.add(b); bases.append(b)
+    left['unlinkable (to the device)'] = unlinked
     return bases, rest, left
 
 
@@ -169,6 +189,7 @@ def main(argv=None):
     ap.add_argument('--platform', choices=('ios', 'macos'), default='ios')
     ap.add_argument('--os-min', help='minimum OS of the archives (default: the SDK\'s major version)')
     ap.add_argument('--script-only', action='store_true', help='write the script and the stamp, run no metal-tt')
+    ap.add_argument('--leave', help='a file of pairs (vertex key <TAB> pixel key) left to the device instead of the archive, beside the unlinkable pairs plan() finds itself')
     a = ap.parse_args(argv)
     if a.game:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'games')); import game
@@ -186,13 +207,14 @@ def main(argv=None):
     if not text: sys.exit(f'[RED] pso_offline: no pair list ({", ".join(a.pairs)})')
     zero = a.depth == 'zero'
     t0 = time.time()
-    bases, rest, left = plan(lib_dir, chain, read_pairs(text), zero)
+    leave = frozenset(read_pairs(Path(a.leave).read_bytes())) if a.leave else frozenset()
+    bases, rest, left = plan(lib_dir, chain, read_pairs(text), zero, leave)
     work.mkdir(parents=True, exist_ok=True); out.mkdir(parents=True, exist_ok=True)
     js = work / 'bases.mtl4-json'   # metal-tt takes the format from the extension: .mtl4-json is Metal 4's (.mtlp-json is the Metal 3 format)
     body = json.dumps(script(lib_dir, bases), indent=1).encode()
     if not js.is_file() or js.read_bytes() != body: js.write_bytes(body)
     st = stamp(chain, zero, text)
-    print(f'pso_offline: {len(read_pairs(text))} pairs: {len(bases)} bases, {len(rest)} left to the device (function constants), left out as the host leaves them: '
+    print(f'pso_offline: {len(read_pairs(text))} pairs: {len(bases)} bases, {len(rest)} left to the device (function constants, unlinkable pairs, --leave), left out as the host leaves them: '
           + ', '.join(f'{k} {v}' for k, v in left.items()) + f' ({time.time() - t0:.1f} s)')
     if a.script_only: (out / 'prebuilt.tsv').write_text(st); return 0
     if not bases and not rest: sys.exit('[RED] pso_offline: no base to build')
