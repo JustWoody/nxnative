@@ -530,7 +530,7 @@ static void hdr_apply(int lvl) {
 @end
 @implementation DmMenuRow @end
 static NSMutableArray<DmMenuRow *> *g_rows;
-static NSView *g_menu; static int g_sel, g_tab;   // the chosen line; the tab (sections in order, from menu_tabs)
+static NSView *g_menu; static int g_sel, g_tab, g_confirm, g_csel;   // g_confirm: the restart question is up (g_csel its chosen answer)   // the chosen line; the tab (sections in order, from menu_tabs)
 static NSArray<NSString *> *menu_tabs(void);
 static int menu_shows(DmMenuRow *r) { NSArray *t = menu_tabs(); return !r.section.length || (g_tab < (int)t.count && [r.section isEqualToString:t[g_tab]]); }
 static int g_restart_opmode = -1; static NSMutableOrderedSet<NSString *> *g_mods_all, *g_mods_off;
@@ -582,7 +582,15 @@ static NSArray<NSString *> *menu_tabs(void) {   // the sections that have lines,
     return t.array;
 }
 static int menu_pending(void) { for (DmMenuRow *r in g_rows) if (r.restart && r.get && r.get() != r.initial) return 1; return 0; }
-static void menu_close(void);
+static void menu_close(void); static void menu_draw(void); static void menu_restart(void);
+// Leaving the menu (Escape, Home, B, Resume) with changes that need a restart asks first: restart now, keep them for the next start, or put them back
+static void menu_leave(void) { if (menu_pending()) { g_confirm = 1; g_csel = 0; menu_draw(); } else menu_close(); }
+static void menu_answer(int a) {
+    g_confirm = 0;
+    if (a == 0) { menu_restart(); return; }
+    if (a == 2) for (DmMenuRow *r in g_rows) if (r.restart && r.get && r.get() != r.initial) r.set(r.initial);   // settings.env back as it was
+    menu_close();
+}
 static void menu_restart(void) {   // starts the app again a moment after this process has gone (open -n), then quits
     NSString *app = NSBundle.mainBundle.bundlePath;
     LOG("in-game menu: restarting %s", app.UTF8String);
@@ -661,8 +669,7 @@ static void menu_build(void) {
             settings_put(@"DM_MODS_OFF", list.length ? [NSString stringWithFormat:@"\"%@\"", list] : nil); });
         r.restart = 1; r.initial = ![g_mods_off containsObject:m];
     }
-    DmMenuRow *rs = row(@"", @"Restart to apply", nil, nil, nil); rs.act = ^{ menu_restart(); };
-    DmMenuRow *rz = row(@"", @"Resume game", nil, nil, nil); rz.act = ^{ menu_close(); };
+    DmMenuRow *rz = row(@"", @"Resume game", nil, nil, nil); rz.act = ^{ menu_leave(); };
     DmMenuRow *q = row(@"", @"Quit game", nil, nil, nil); q.act = ^{ [NSApp terminate:nil]; };
 }
 static NSTextField *menu_label(NSString *s, CGFloat size, NSFontWeight w, NSColor *c, NSTextAlignment al) {
@@ -671,6 +678,21 @@ static NSTextField *menu_label(NSString *s, CGFloat size, NSFontWeight w, NSColo
 static void menu_draw(void) {
     if (!g_menu) return;
     for (NSView *v in [g_menu.subviews copy]) [v removeFromSuperview];
+    if (g_confirm) {
+        const CGFloat W = 460, H = 230; NSArray *ans = @[@"Restart now", @"Apply at the next start", @"Discard changes"];
+        NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(floor((g_menu.bounds.size.width - W) / 2), floor((g_menu.bounds.size.height - H) / 2), W, H)];
+        box.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+        box.wantsLayer = YES; box.layer.backgroundColor = [NSColor colorWithWhite:0.11 alpha:0.98].CGColor; box.layer.cornerRadius = 14;
+        NSTextField *t = menu_label(@"Apply changes?", 19, NSFontWeightSemibold, NSColor.whiteColor, NSTextAlignmentLeft); t.frame = NSMakeRect(22, H - 48, W - 44, 26); [box addSubview:t];
+        NSTextField *m = menu_label(@"Some changes take effect when the game starts again. Progress not saved in the game is lost on a restart.", 12, NSFontWeightRegular, [NSColor colorWithWhite:0.75 alpha:1], NSTextAlignmentLeft);
+        m.frame = NSMakeRect(22, H - 88, W - 44, 34); m.maximumNumberOfLines = 2; m.cell.wraps = YES; [box addSubview:m];
+        for (int i = 0; i < 3; i++) {
+            NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(12, H - 128 - 32 * i, W - 24, 28)]; line.wantsLayer = YES; line.layer.cornerRadius = 6;
+            if (i == g_csel) line.layer.backgroundColor = [NSColor colorWithRed:0.18 green:0.42 blue:0.95 alpha:1].CGColor;
+            NSTextField *l = menu_label(ans[i], 15, NSFontWeightRegular, NSColor.whiteColor, NSTextAlignmentLeft); l.frame = NSMakeRect(12, 4, W - 60, 20); [line addSubview:l]; [box addSubview:line];
+        }
+        [g_menu addSubview:box]; return;
+    }
     const CGFloat W = 520, rh = 30, pad = 22; int pending = menu_pending();
     NSMutableArray<NSView *> *lines = [NSMutableArray new]; NSString *sec = nil; CGFloat h = 0;
     NSMutableArray<NSNumber *> *ys = [NSMutableArray new]; CGFloat sel_y = 0; static CGFloat scroll;
@@ -679,7 +701,7 @@ static void menu_draw(void) {
         if (!menu_shows(r)) continue;
         if (!r.section.length && !sec) { sec = @""; h += 14; }   // the gap before Restart / Resume / Quit
         NSView *line = [[NSView alloc] initWithFrame:NSMakeRect(10, 0, W - 20, rh)]; line.wantsLayer = YES; line.layer.cornerRadius = 6;
-        int dim = r.act && [r.title isEqualToString:@"Restart to apply"] && !pending;
+        int dim = 0;
         if ((int)i == g_sel) line.layer.backgroundColor = [NSColor colorWithRed:0.18 green:0.42 blue:0.95 alpha:1].CGColor;
         NSColor *fg = dim ? [NSColor colorWithWhite:0.45 alpha:1] : NSColor.whiteColor;
         NSString *title = r.restart ? [r.title stringByAppendingString:@"  ↻"] : r.title;
@@ -692,7 +714,7 @@ static void menu_draw(void) {
         [lines addObject:line]; [ys addObject:@(h)]; h += rh;
     }
     NSTextField *head = menu_label(@DM_GAME_NAME, 20, NSFontWeightSemibold, NSColor.whiteColor, NSTextAlignmentLeft);
-    NSTextField *foot = menu_label(pending ? @"↻ changes apply after a restart; progress not saved in the game is lost" : @"↻ needs a restart  ·  L / R tabs  ·  Esc or Home closes",
+    NSTextField *foot = menu_label(pending ? @"↻ changed: you choose when to restart as you close the menu" : @"↻ needs a restart  ·  L / R tabs  ·  Esc or Home closes",
                                    12, NSFontWeightRegular, [NSColor colorWithWhite:pending ? 0.85 : 0.55 alpha:1], NSTextAlignmentLeft);
     CGFloat H = h + 72 + 40 + 2 * pad, avail = g_menu.bounds.size.height - 40, view = h;
     if (H > avail && avail > 200) {   // taller than the window: the lines scroll so the chosen one stays in view
@@ -735,7 +757,7 @@ static void menu_tab(int d) {   // the next / previous tab, on its first line
 }
 static void menu_change(int d) {   // d: +1 / -1 a value, 0 = A / Return (the next value, or the line's action)
     DmMenuRow *r = g_rows[g_sel];
-    if (r.act) { if (d == 0 && !([r.title isEqualToString:@"Restart to apply"] && !menu_pending())) r.act(); return; }
+    if (r.act) { if (d == 0) r.act(); return; }
     int n = (int)r.choices.count, v = r.get(); r.set(((v + (d < 0 ? -1 : 1)) % n + n) % n);
     menu_draw();
 }
@@ -755,14 +777,14 @@ static void menu_open(void) {
 }
 static void menu_close(void) {
     if (!g_menu_open) return;
-    g_menu_open = 0; g_menu_swallow = 1; [g_menu removeFromSuperview]; g_menu = nil;
+    g_menu_open = 0; g_confirm = 0; g_menu_swallow = 1; [g_menu removeFromSuperview]; g_menu = nil;
     if (g_win.isKeyWindow) { dm_focus_set(1); input_resume(); }
     LOG("in-game menu: closed");
 }
-static void menu_toggle(void) { if (g_menu_open) menu_close(); else menu_open(); }
+static void menu_toggle(void) { if (g_menu_open) menu_leave(); else menu_open(); }
 static void menu_home(void) {   // Home from GameController or from the Pro Controller's reports, whichever comes first: one press toggles once
     static uint64_t last; uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    if (now - last > 300000000ull) menu_toggle();
+    if (now - last > 300000000ull) { if (g_confirm) { g_confirm = 0; menu_draw(); } else menu_toggle(); }
     last = now;
 }
 // A controller while the panel is up: each button and the stick act on their press (edge), not while held
@@ -770,18 +792,26 @@ static void menu_pad(uint64_t m, int32_t ly) {
     static uint64_t prev; static int prev_y;
     uint64_t dn = m & ~prev; prev = m;
     int y = ly > DM_STICK_MAX / 2 ? 1 : ly < -DM_STICK_MAX / 2 ? -1 : 0, ydn = y != prev_y ? y : 0; prev_y = y;
+    if (g_confirm) {
+        if ((dn & DM_BTN_UP) || ydn > 0) { g_csel = (g_csel + 2) % 3; menu_draw(); }
+        if ((dn & DM_BTN_DOWN) || ydn < 0) { g_csel = (g_csel + 1) % 3; menu_draw(); }
+        if (dn & DM_BTN_A) menu_answer(g_csel);
+        if (dn & DM_BTN_B) { g_confirm = 0; menu_draw(); }   // back to the menu
+        return;
+    }
     if ((dn & DM_BTN_UP) || ydn > 0) menu_move(-1);
     if ((dn & DM_BTN_DOWN) || ydn < 0) menu_move(1);
     if (dn & DM_BTN_LEFT) menu_change(-1);
     if (dn & DM_BTN_RIGHT) menu_change(1);
     if (dn & DM_BTN_A) menu_change(0);
-    if (dn & DM_BTN_B) menu_close();
+    if (dn & DM_BTN_B) menu_leave();
     if (dn & DM_BTN_L) menu_tab(-1);
     if (dn & DM_BTN_R) menu_tab(1);
 }
 static int menu_key(unsigned short c, int down) {   // 1 = the menu took the key
-    if (c == 53) { if (down) menu_toggle(); return 1; }   // Escape
+    if (c == 53) { if (down) { if (g_confirm) { g_confirm = 0; menu_draw(); } else menu_toggle(); } return 1; }   // Escape
     if (!g_menu_open) return 0;
+    if (g_confirm) { if (down) switch (c) { case 126: g_csel = (g_csel + 2) % 3; menu_draw(); break; case 125: g_csel = (g_csel + 1) % 3; menu_draw(); break; case 36: case 49: case 76: menu_answer(g_csel); break; } return 1; }
     if (down) switch (c) { case 126: menu_move(-1); break; case 125: menu_move(1); break; case 123: menu_change(-1); break; case 124: menu_change(1); break; case 36: case 49: case 76: menu_change(0); break; case 12: menu_tab(-1); break; case 14: case 48: menu_tab(1); break; }
     return 1;
 }
