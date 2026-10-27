@@ -64,6 +64,9 @@ int nro_refused(const uint8_t sha256[32]);      // an NRO the pack refused (an o
 void nro_load(module_t *m);     // relocate an NRO against the loaded modules and bind the earlier modules' imports it defines (the caller runs its init)
 void nro_unload(module_t *m);   // take an NRO out of the lookups and bind the imports that pointed into it again
 void *module_sym(module_t *m, const char *name);
+void dm_fontll_enter(void);     // the font engine lock (hle_fontll.c): taken by a thread's engine calls with font_engine_lock on
+void dm_fontll_release(void);   // ... and given up when the thread enters an SVC, a spin wait or a native wait
+void dm_host_lock(pthread_mutex_t *m);   // a host lock taken as a native HLE wait (hle_thread.c)
 int dm_sdk_major(void);   // SDK major version from the sdk module's version string (loader.c); 0 = unknown
 #define DM_SDK_OLD(major) ((major) > 0 && (major) <= 10)   // SDK 10 and older: NVN API 53, the shared-font address points at the TTF itself
 int dm_main_imports(const char *prefix);   // main imports a symbol whose name starts with prefix (loader.c)

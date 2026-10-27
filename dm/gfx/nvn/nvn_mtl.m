@@ -2946,7 +2946,7 @@ static void defer_fallback(void);
 // the encoder track and the GPU interval table carry this name directly, and shader_map.tsv maps it back to the shader; off by default (one string allocation per pass)
 static int g_el_w, g_el_h, g_el_draws; static char g_el_key[12];
 static int enc_label_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ENC_LABEL"); v = e && atoi(e); } return v; }
-static int g_nbcrt; static void bcrt_flush(void);   // shadows of block-compressed render targets used by the open pass (see bcrt_attach)
+static int g_nbcrt; static void bcrt_flush(void); static int g_ndsh; static void dsh_flush(void);   // shadows of block-compressed render targets used by the open pass (see bcrt_attach)
 static void rp_end(void) { if (g_enc) { AP_B;
     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
@@ -2957,6 +2957,7 @@ static void rp_end(void) { if (g_enc) { AP_B;
     zskip_commit_clears(); g_enc = nil; g_rt_merged = 0; g_sm_pass = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
+    if (g_ndsh) dsh_flush();     // duplicate colour slots' channels go back into their textures
 #ifdef NVN_RT_RANGE_TEST
     rr_finish(ranged);
 #endif
@@ -3049,15 +3050,98 @@ static MTLPixelFormat rt_view_fmt(id<MTLTexture> base, const view_t *v, int has_
 // (c1 = c2, c3 = c4), and the channel write masks of c2 / c4 are always 0 (cmask 0x00f0f0ff). The Switch's ROP writes only the masked channels and the two slots do not interfere;
 // on Apple's TBDR each attachment has its own tile memory and the whole tile is stored back at the end of the pass, so the copy stored later (loaded, never written) overwrites the writes of the earlier one -- the order differs per 32x32 tile,
 // the albedo kept only scattered squares, and the whole 3D picture went black. A red line is printed when a dropped slot is used with a non-zero write mask (those writes are really lost)
-static int rt_dup_slot(const p_set_rt *r, int i) {
-    if (!r->color[i]) return 0;
+static int rt_dup_of(const p_set_rt *r, int i) {   // the earlier slot holding slot i's texture, level and layer, or -1
+    if (!r->color[i]) return -1;
     uint8_t lv = r->has_cview[i] && r->cview[i].set_levels ? r->cview[i].base_level : 0; uint16_t ly = r->has_cview[i] && r->cview[i].set_layers ? r->cview[i].min_layer : 0;
     for (int j = 0; j < i; j++) {
         if (!r->color[j] || r->color[j]->serial != r->color[i]->serial) continue;   // compare serials: records hold copies of the texture objects (tex_snap), so the pointers differ
         uint8_t lj = r->has_cview[j] && r->cview[j].set_levels ? r->cview[j].base_level : 0; uint16_t yj = r->has_cview[j] && r->cview[j].set_layers ? r->cview[j].min_layer : 0;
-        if (lj == lv && yj == ly) return 1;
+        if (lj == lv && yj == ly) return j;
     }
-    return 0;
+    return -1;
+}
+// A duplicate slot that draws really write (Tomodachi Life: Living the Dream: slot 1 repeats slot 0's texture and writes its alpha, mask 0x8, while slot 0 writes the colour; green blocks
+// where the alpha stayed stale). Learned at the first such write (that pass still loses them): from then on the slot is attached as a shadow of its own, a copy of the level / layer made before the pass,
+// and after the pass the channels the duplicate slot wrote are drawn from the shadow into the texture with that write mask (dsh_flush). Exact when the two slots write different channels, as the
+// Switch's ROP then lands both; a texture whose duplicate slot only ever has write mask 0 (Breath of the Wild) is never learned and stays unattached as above
+enum { DSH_MAX = 32 };
+static uint64_t g_dsh_ser[DSH_MAX]; static uint8_t g_dsh_mask[DSH_MAX]; static int g_ndsh_ser;
+static int dsh_find(uint64_t ser) { for (int k = 0; k < g_ndsh_ser; k++) if (g_dsh_ser[k] == ser) return k; return -1; }
+static void dsh_learn(uint64_t ser, unsigned mask) {
+    int k = dsh_find(ser);
+    if (k < 0) { if (g_ndsh_ser >= DSH_MAX) return; k = g_ndsh_ser++; g_dsh_ser[k] = ser;
+        MLOG("duplicate colour slot written (ser=%llu, mask %#x): from the next pass it draws into a shadow merged back after the pass", (unsigned long long)ser, mask);
+        const char *shot = getenv("DM_NVN_DUP_SHOT");   // DM_NVN_DUP_SHOT=<path with %d>: a screenshot of the frame where a duplicate slot is first written, and one 30 frames later
+        if (shot && *shot) { char b[1024]; snprintf(b, sizeof b, shot, (int)ser); dm_gfx_shot_at(1, b); snprintf(b, sizeof b, shot, (int)ser + 1000000); dm_gfx_shot_at(30, b); } }
+    g_dsh_mask[k] |= (uint8_t)mask;
+}
+static int rt_dup_slot(const p_set_rt *r, int i) { return rt_dup_of(r, i) >= 0 && dsh_find(r->color[i]->serial) < 0; }   // a duplicate slot left unattached (not learned)
+typedef struct { id<MTLTexture> tex, shadow; NSUInteger level, slice; uint64_t ser; } dsh_t;
+static dsh_t g_dsh[8];
+static __strong id<MTLTexture> g_dsh_sh[8];
+static int dsh_is(id<MTLTexture> t) { for (int i = 0; i < g_ndsh; i++) if (t && g_dsh[i].shadow == t) return 1; return 0; }
+// a holds the duplicate slot's texture (attach), level and layer already set; returns 1 when a now holds the shadow, loaded with a copy of that level / layer
+static int dsh_attach(MTLRenderPassAttachmentDescriptor *a, uint64_t ser) {
+    id<MTLTexture> t = a.texture; int k = g_ndsh;
+    if (!t || k >= 8 || t.textureType == MTLTextureType3D || t.sampleCount > 1 || mtl_fmt_block(t.pixelFormat) || mtl_fmt_depth(t.pixelFormat)) return 0;
+    NSUInteger w = mip_extent(t.width, a.level), h = mip_extent(t.height, a.level);
+    if (!g_dsh_sh[k] || g_dsh_sh[k].pixelFormat != t.pixelFormat || g_dsh_sh[k].width != w || g_dsh_sh[k].height != h) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.pixelFormat width:w height:h mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> sh = [g_dev newTextureWithDescriptor:d];
+        if (!sh) { RED_ONCE(90, "duplicate colour slot: cannot create its %lux%lu shadow (Metal format %lu); its writes are lost", (unsigned long)w, (unsigned long)h, (unsigned long)t.pixelFormat); return 0; }
+        if (g_dsh_sh[k]) defer_obj_release(g_dsh_sh[k]);
+        res_add(sh); g_dsh_sh[k] = sh;
+    }
+    id<MTLTexture> sh = g_dsh_sh[k];
+    enc_b_copy_texture(blit(), t, a.slice, a.level, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), sh, 0, 0, MTLOriginMake(0, 0, 0));
+    g_dsh[g_ndsh++] = (dsh_t){t, sh, a.level, a.slice, ser};
+    a.texture = sh; a.level = 0; a.slice = 0; a.depthPlane = 0;
+    static int once; if (!once++) MLOG("duplicate colour slot drawn into a %lux%lu shadow (Metal format %lu) and merged back after the pass (first case pass %llu)", (unsigned long)w, (unsigned long)h, (unsigned long)t.pixelFormat, g_stat_pass + 1);
+    return 1;
+}
+static int pf_int_kind(MTLPixelFormat f);
+static void dsh_flush(void) {   // after the pass: the duplicate slots' channels drawn from their shadows into the textures, with the learned write masks
+    static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *pso; static id<MTLFunction> vf, ff[3]; static id<MTL4ArgumentTable> at; static int failed;
+    int n = g_ndsh; g_ndsh = 0;
+    if (failed || !n) return;
+    if (!pso) {
+        static const char *src =
+            "#include <metal_stdlib>\nusing namespace metal;\n"
+            "struct V { float4 p [[position]]; };\n"
+            "vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+            "fragment float4 ff(V in [[stage_in]], texture2d<float> t [[texture(0)]]) { return t.read(uint2(in.p.xy)); }\n"
+            "fragment uint4 fu(V in [[stage_in]], texture2d<uint> t [[texture(0)]]) { return t.read(uint2(in.p.xy)); }\n"
+            "fragment int4 fi(V in [[stage_in]], texture2d<int> t [[texture(0)]]) { return t.read(uint2(in.p.xy)); }\n";
+        NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src) options:nil error:&e];
+        vf = [lib newFunctionWithName:@"vs"]; ff[0] = [lib newFunctionWithName:@"ff"]; ff[1] = [lib newFunctionWithName:@"fu"]; ff[2] = [lib newFunctionWithName:@"fi"];
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; at = rec_table([g_dev newArgumentTableWithDescriptor:ad error:&e]);
+        if (!vf || !ff[0] || !ff[1] || !ff[2] || !at) { failed = 1; MLOG("[RED] duplicate colour slot: cannot create the merge pipelines: %s", e.localizedDescription.UTF8String); return; }
+        pso = [NSMutableDictionary dictionary];
+    }
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    for (int i = 0; i < n; i++) { dsh_t e = g_dsh[i]; g_dsh[i] = (dsh_t){0};
+        int k = dsh_find(e.ser); unsigned m = k >= 0 ? g_dsh_mask[k] : 0; if (!m) continue;
+        int kind = pf_int_kind(e.tex.pixelFormat);
+        NSNumber *pk = @(((uint64_t)e.tex.pixelFormat << 4) | m);
+        id<MTLRenderPipelineState> ps = pso[pk];
+        if (!ps) {
+            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vf; pd.fragmentFunction = ff[kind < 0 || kind > 2 ? 0 : kind];
+            pd.colorAttachments[0].pixelFormat = e.tex.pixelFormat;
+            pd.colorAttachments[0].writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
+            NSError *err = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            if (!ps) { RED_ONCE(91, "duplicate colour slot: cannot create the merge pipeline for format %lu mask %#x: %s", (unsigned long)e.tex.pixelFormat, m, err.localizedDescription.UTF8String); continue; }
+            pso[pk] = ps;
+        }
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        rp.colorAttachments[0].texture = e.tex; rp.colorAttachments[0].level = e.level; rp.colorAttachments[0].slice = e.slice;
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        ser_gate(); id<MTL4RenderCommandEncoder> en = enc_r_begin(rp);
+        [en setArgumentTable:at atStages:MTLRenderStageFragment]; [at setTexture:e.shadow.gpuResourceID atIndex:0];
+        [en setViewport:(MTLViewport){0, 0, (double)e.shadow.width, (double)e.shadow.height, 0, 1}];
+        [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; enc_r_end(en);
+    }
+    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
 }
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
     id<MTLTexture> base = tex_mtl(t); a.texture = base;
@@ -3103,12 +3187,13 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         if (!R.rt.color[i] || (clear_only == 1 && !R.clear_c[i])) continue;
         if (rt_dup_slot(&R.rt, i)) continue;   // a slot attached twice is not attached (see rt_dup_slot)
         attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
+        if (rt_dup_of(&R.rt, i) >= 0 && !(clear_only == 1 ? 0 : dsh_attach(pd.colorAttachments[i], R.rt.color[i]->serial))) continue;   // a learned duplicate slot: its shadow, or not attached
         if (!pd.colorAttachments[i].texture) continue;
         any = 1;
         pd.colorAttachments[i].loadAction = R.clear_c[i] ? MTLLoadActionClear : MTLLoadActionLoad;
         pd.colorAttachments[i].clearColor = R.cc[i];
         if (R.clear_c[i]) PD("C %llu c%d cleared to %g,%g,%g,%g", g_stat_pass + 1, i, R.cc[i].red, R.cc[i].green, R.cc[i].blue, R.cc[i].alpha);
-        if (bcrt_is(pd.colorAttachments[i].texture)) { pd.colorAttachments[i].storeAction = MTLStoreActionStore; continue; }   // a shadow (bcrt_attach): loaded and stored as is, outside the bookkeeping below
+        if (bcrt_is(pd.colorAttachments[i].texture) || dsh_is(pd.colorAttachments[i].texture)) { pd.colorAttachments[i].storeAction = MTLStoreActionStore; continue; }   // a shadow (bcrt_attach, dsh_attach): loaded and stored as is, outside the bookkeeping below
         int cov = tbdr_on() && !R.clear_c[i] && (g_fd_dw || g_fd_di) && fz_load_covers(i, pd.colorAttachments[i].texture, pd.colorAttachments[i].level);
         if (!R.clear_c[i] && (g_fd_dw || g_fd_di) && !cov) PD("Q %llu c%d load cannot be skipped why=%d", g_stat_pass + 1, i, g_fd_why);
         if (cov) {
@@ -4278,8 +4363,9 @@ static void udc_note_draw(NvProg *pr) {
     if (!tbdr_on()) {   // without the TBDR set only the duplicate-slot report below is live (the zero-source skip and the unwritten-attachment store are part of the set): skip the per-draw scans
         uint32_t cm = pr && pr->sh[1] ? pr->sh[1]->rf.color_mask : 0;
         if (R.has_rt && cm >> 1) for (int i = 1; i < R.rt.n && i < 8; i++)
-            if ((cm >> i & 1) && ((S.chmask.mask >> (4 * i)) & 0xf) && rt_dup_slot(&R.rt, i))
-                RED_ONCE(79, "color slot %d holds the same texture as an earlier slot (ser=%llu) and this draw writes it (mask %#x): these writes are lost", i, (unsigned long long)R.rt.color[i]->serial, (S.chmask.mask >> (4 * i)) & 0xf);
+            if ((cm >> i & 1) && ((S.chmask.mask >> (4 * i)) & 0xf) && rt_dup_of(&R.rt, i) >= 0) {
+                if (rt_dup_slot(&R.rt, i)) RED_ONCE(79, "color slot %d holds the same texture as an earlier slot (ser=%llu) and this draw writes it (mask %#x): these writes are lost in this pass (learned: a shadow from the next)", i, (unsigned long long)R.rt.color[i]->serial, (S.chmask.mask >> (4 * i)) & 0xf);
+                dsh_learn(R.rt.color[i]->serial, (S.chmask.mask >> (4 * i)) & 0xf); }
         return;
     }
     if (R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) { zskip_del(R.rt.color[i]->serial); g_zskip_cand_ok[i] = 0; }   // Zero-source set: once really drawn it is no longer all zeros
@@ -4292,8 +4378,9 @@ static void udc_note_draw(NvProg *pr) {
         if (image_write) break;
     }
     if (R.has_rt) for (int i = 1; i < R.rt.n && i < 8; i++)   // a slot attached twice (left unattached) really written: the writes are lost (see rt_dup_slot)
-        if ((shader_color_mask >> i & 1) && ((S.chmask.mask >> (4 * i)) & 0xf) && rt_dup_slot(&R.rt, i))
-            RED_ONCE(79, "color slot %d holds the same texture as an earlier slot (ser=%llu) and this draw writes it (mask %#x): these writes are lost", i, (unsigned long long)R.rt.color[i]->serial, (S.chmask.mask >> (4 * i)) & 0xf);
+        if ((shader_color_mask >> i & 1) && ((S.chmask.mask >> (4 * i)) & 0xf) && rt_dup_of(&R.rt, i) >= 0) {
+            if (rt_dup_slot(&R.rt, i)) RED_ONCE(79, "color slot %d holds the same texture as an earlier slot (ser=%llu) and this draw writes it (mask %#x): these writes are lost in this pass (learned: a shadow from the next)", i, (unsigned long long)R.rt.color[i]->serial, (S.chmask.mask >> (4 * i)) & 0xf);
+            dsh_learn(R.rt.color[i]->serial, (S.chmask.mask >> (4 * i)) & 0xf); }
     for (int i = 0; i < g_nsd; i++) {
         sd_att *t = &g_sd[i];
         if (image_write) { t->wrote = 1; t->wwhy = 1; }

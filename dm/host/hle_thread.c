@@ -141,6 +141,7 @@ static void hand_leave(thr_t *t) { t->nhand = 0; }
 // between publishing its blocked state and pthread_cond_wait releasing that
 // mutex. On return it is runnable before it goes back to guest code.
 void dm_thread_native_wait(int entering) {
+    if (entering) dm_fontll_release();   // a native wait never holds the font engine (hle_fontll.c)
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t) return;
     pthread_mutex_lock(&G);
@@ -348,6 +349,7 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
 }
 // called by the gate on SVC entry / exit (gate_dispatch in hle.c)
 void thr_svc_enter(uint64_t *regs, uint64_t pc) {
+    dm_fontll_release();   // a thread gives up the font engine at its next SVC or spin wait (hle_fontll.c)
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
     t->svc_pc = pc; t->svc_x18 = (uint64_t)(uintptr_t)pthread_getspecific(g_key18); atomic_store(&t->svc_regs, regs); atomic_fetch_or(&t->svc_state, 1);
     if (atomic_load_explicit(&t->qos_pending, memory_order_relaxed) && atomic_exchange(&t->qos_pending, 0)) qos_apply(t);
