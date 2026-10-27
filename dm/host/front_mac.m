@@ -680,6 +680,7 @@ static void menu_build(void) {
         sw2.restart = 1; sw2.initial = now;
     }
     menu_game_settings(@"Game");
+    menu_game_settings(@"Graphics");   // a game's own ini settings (switchports/ini_settings.py: Skyrim's Skyrim.ini), a tab only where launcher.json has such rows
     abxy_init();
     row(@"Controls", @"A B X Y buttons", @[@"Automatic", @"By label", @"By position"], ^int { return g_abxy < 0 ? 0 : g_abxy ? 1 : 2; }, ^(int v) {
         g_abxy = v == 0 ? -1 : v == 1 ? 1 : 0;
