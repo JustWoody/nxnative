@@ -1524,7 +1524,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[120];
+static int g_red_once[128];   // one more than the highest RED_ONCE number
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -6050,6 +6050,16 @@ static id<MTLSamplerState> dummy_samp(void) {
 static uint64_t dummy_samp_rid(void) { static uint64_t rid; if (!rid) rid = dummy_samp().gpuResourceID._impl; return rid; }
 static id<MTLBuffer> dummy_buf(void) { static id<MTLBuffer> b; if (!b) { b = [g_dev newBufferWithLength:64 << 10 options:MTLResourceStorageModeShared]; res_add(b); } return b; }
 static uint64_t dummy_buf_gpu(void) { static uint64_t gpu; if (!gpu) gpu = dummy_buf().gpuAddress; return gpu; }
+// A writable storage buffer the game binds by an address the host cannot resolve, larger than the dummy: a scratch buffer of at least its size that the writes land in. The Elder
+// Scrolls V: Skyrim with volumetric lighting on fills its 1080p depth-stencil target's raw memory with a dither pattern from a compute shader (main+0x20d0a60, a storage buffer of
+// 1920x1152x4 bytes at the target's address); the target is a GPU-only Metal texture whose storage has no guest address (0), and the 8.4 MB of writes went into the 64 KB dummy
+// and on into the memory after it: the GPU faulted and discarded every frame (a black screen), and the game's heap was overwritten (a crash in its allocator). Grown, never shrunk
+static id<MTLBuffer> sink_buf(uint64_t size) {
+    static id<MTLBuffer> b; static uint64_t have;
+    if (size > have) { uint64_t n = (size + (1u << 20) - 1) & ~(uint64_t)((1u << 20) - 1); id<MTLBuffer> nb = [g_dev newBufferWithLength:n options:MTLResourceStorageModePrivate]; if (!nb) return nil;
+        if (b) defer_obj_unref(b); b = nb; have = n; res_add(b); }
+    return b;
+}
 // The texture of an image slot (a view of the shader's class when the texture's differs, img_fit), else the write sink. Caller holds g_rmu
 static id<MTLTexture> img_binding(int tid, const nvn_rbind *b, uint64_t *rid, int *real) {
     void *tv = NULL; *rid = tid ? tex_fast_rid(tid, &tv) : 0;
@@ -6311,6 +6321,10 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
             void *mb; uint64_t mo, gpu;
             if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw && b->kind == NVN_RB_SBUFP && !(reg < 32 && (sh->sb_ro >> reg & 1))) sbw_note(u->addr, u->size, SBW_GPU); }   // cb_extent.tsv: slots the shader never writes
+            else if (b->rw && b->kind == NVN_RB_SBUFP && u && u->size > (64u << 10) && sink_buf(u->size)) {   // see sink_buf
+                id<MTLBuffer> sk = sink_buf(u->size); slots[aid] = sk.gpuAddress; USE(sk, MTLResourceUsageRead | MTLResourceUsageWrite);
+                RED_ONCE(122, "shader %s (stage %d) writes a %llu-byte storage buffer at %#llx, which is in no memory pool the host can address (a GPU-only texture's storage?): its writes go to a scratch buffer (first case)", sh->key, nvn_stage, (unsigned long long)u->size, (unsigned long long)u->addr);
+            }
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufp reg%d %s addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, u && u->addr ? "real" : "dummy", u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_SBUFU) {   // B: a storage buffer whose GPU address the game keeps in its own uniform buffer (Monster Hunter Rise's compute shaders: c3 + 0x38); read like a bindless handle
