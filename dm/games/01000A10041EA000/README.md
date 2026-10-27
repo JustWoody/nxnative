@@ -1,0 +1,13 @@
+# The Elder Scrolls V: Skyrim (`01000A10041EA000`)
+
+Update 1.1.404.0 (v393216) over the base game (base SDK 3.4.0, the update's SDK 14.3.0), with the Anniversary Upgrade DLC; the update itself carries the Creation Club content (`Data/cc*.bsa` / `.esl` / `.esm`). Bethesda's Creation Engine on NVN, with Bink 2 for its movies and Havok. Modules `main` and `sdk`. 12.4 GB of RomFS, nearly all in Bethesda's BSA archives. Runs at 30 fps as on the Switch.
+
+Bring-up on a Mac (M3 Pro), 2026-10-27, from the provisional profile:
+
+- **Shaders:** all 23,082 of the RomFS are in `shadersfx/shaders011.fxp`, the one member of `Data/Skyrim - Shaders.bsa`: records of a 0x40-byte header and an NVN control section with its code area right after it. 53 more are in `main` in the same record format at odd addresses (Bink 2's movie shaders at main+0x20e0ce0, 0x7d1-byte control sections, and its built-in ones). `shader_split.py` `bsa_members` / `fxp_shaders`; pairs by cover (`#BTH@`).
+- **Memory (`mem_reserve` / `mem_alias`):** its memory manager reserves 2 GB of address space for each heap at boot ("Default Heap", "GPU Heap", main+0xac4680 through the vtable's +0x80) and calls `exit()` when a reservation fails (main+0xac46c8): the second did not fit a 4.375 GB alias region. A Switch gives a process with a system resource a 64 GB alias region; the Mac gets 32 GB of address space (only mapped pages are memory: 1.75 GB at the title).
+- **Audio:** it opens two audio renderers, the game's (110 voices) and Bink's (32); every renderer now has its own render thread and output (`hle_audren.c`).
+- **`render_cond on`:** the movie player waits for "GPU done" flags (main+0xbffe2c: `while (*flag) YieldThread()`) that it clears with timestamp counter reports, whose counter field the GPU writes as 0; without the key the host wrote the timestamp there, the Bethesda logo movie never got past its second frame and the boot job that stops it waited forever.
+- **New game:** the "how to hold the Joy-Con" picture is a 1280x720 RGBA8 linear texture built with `SetStride` 3840 (rows overlapping); Metal's validation aborted on it. Such a texture is now filled as the GPU reads it (`nvn_mtl.m` `tex_linear`).
+- It asks `nvnCommandBufferGetControlMemoryFree` before each recording (now answered).
+- PC mods do not apply: the Switch build loads only its own plugins and archives.
