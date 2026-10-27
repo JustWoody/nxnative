@@ -60,8 +60,12 @@ HLE_FORCE("_ZNK2nn3mii8Database14IsFullDatabaseEv", "mii:u service; empty, so no
 // Source flags: 1 the console's database (empty here), 2 the six default Miis every console has. Mario Kart 8 Deluxe asks for the defaults with room for 6 and never reads the count
 // (main+0x81e954): its boot-time list of Mii icons (main+0x419dc8) builds a head for each of the six, and zeroed entries failed the model's CharInfo check
 enum { MII_SRC_DATABASE = 1, MII_SRC_DEFAULT = 2, MII_DEFAULTS = 6 };
+static void mii_ask_log(const char *what, int src, int n) {   // which lists a game asks for (Tomodachi Life: does its import screen take the defaults?), the first 12 asks
+    static int asks; if (asks++ < 12) LOG("mii: %s source %d%s%s, room for %d", what, src, src & 1 ? " (console's Miis: none)" : "", src & 2 ? " (the six defaults)" : "", n);
+}
 static int mii_get(void *buf, int n, int src, size_t stride) {
     int k = 0;
+    mii_ask_log("Database::Get", src, n);
     for (; (src & MII_SRC_DEFAULT) && buf && k < n && k < MII_DEFAULTS; k++) {
         uint8_t *e = (uint8_t *)buf + (size_t)k * stride;
         mii_default((mii_charinfo *)e, k >= 3, k);
@@ -69,7 +73,7 @@ static int mii_get(void *buf, int n, int src, size_t stride) {
     }
     return k;
 }
-HLE_FORCE("_ZNK2nn3mii8Database8GetCountEi", "mii:u service; the six default Miis", int, h_mii_Count, const void *self, int src) { (void)self; return src & MII_SRC_DEFAULT ? MII_DEFAULTS : 0; }
+HLE_FORCE("_ZNK2nn3mii8Database8GetCountEi", "mii:u service; the six default Miis", int, h_mii_Count, const void *self, int src) { (void)self; mii_ask_log("Database::GetCount", src, 0); return src & MII_SRC_DEFAULT ? MII_DEFAULTS : 0; }
 HLE_FORCE("_ZN2nn3mii8Database3GetEPiPNS0_15CharInfoElementEii", "mii:u service; the six default Miis", Result, h_mii_GetE, void *self, int *out, void *buf, int n, int src) {
     (void)self; *out = mii_get(buf, n, src, sizeof(mii_charinfo) + 4); return RES_OK;
 }
