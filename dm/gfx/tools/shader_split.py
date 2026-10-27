@@ -1754,15 +1754,18 @@ def bsa_members(path, want):
             out.append((member, data))
     return out
 
-def fxp_shaders(d, label):
+def fxp_shaders(d, label, in_code=False):
     """Bethesda's shader file (the Switch's Skyrim: shadersfx/shaders011.fxp, the one member of 'Skyrim - Shaders.bsa', 23,063 graphics and 19 compute shaders): records of a 0x40-byte header
     (u32 2, 2, magic 0x11223344, …) and the NVN control section, followed right after it by its code area (the control section's +0x704 gives the code area's length). Which vertex and
-    pixel shaders draw together is not recorded, so each is a program of one stage (SINGLE_STAGE) paired by cover, as GLSLC outputs are"""
+    pixel shaders draw together is not recorded, so each is a program of one stage (SINGLE_STAGE) paired by cover, as GLSLC outputs are.
+    in_code: records in a code module, at any byte alignment, taken only where the 16 bytes before the control section are the record's offsets {0x10, control length, 0x10 + control length,
+    code length} (Skyrim's main keeps Bink 2's three movie shaders so at main+0x20e0ce0, 0x7d1-byte control sections at odd addresses; without them the logo movie never finished)"""
     out, bad = [], 0
     for m in re.finditer(re.escape(CTL_MAGIC), d):
         c = m.start()
-        if c & 3 or c + 0x708 > len(d): continue
+        if (c & 3 and not in_code) or c + 0x708 > len(d) or in_code and c < 0x10: continue
         nctl, n = struct.unpack_from('<I', d, c + 0x20)[0], struct.unpack_from('<I', d, c + 0x704)[0]
+        if in_code and struct.unpack_from('<4I', d, c - 0x10) != (0x10, nctl, 0x10 + nctl, n): continue
         ctl, code = d[c:c + nctl], d[c + nctl:c + nctl + n]
         st = glslc_stage(ctl, code) if len(code) == n and CTL_MAGIC not in code else None
         if st and not check(label, st, ctl, code): out.append((f'{label}#BTH@{c:#x}', st, ctl, code))
@@ -1974,6 +1977,7 @@ def main():
         found += glslc_shaders(img, 'main' + ('@' + tag if tag else ''), need=False)
         found += tfxo_streams(img, 'main' + ('@' + tag if tag else ''))   # YEBIS's effect file, a zlib stream in main (Pokémon Sword)
         found += retro_main_forms(img, 'main' + ('@' + tag if tag else ''))   # Retro's startup material archive, LZSS in main (Donkey Kong Country: Tropical Freeze)
+        found += fxp_shaders(img, 'main' + ('@' + tag if tag else ''), in_code=True)   # Bethesda's shader records in main (Skyrim: Bink 2's movie shaders)
         found += raw_shaders(img, 'main' + ('@' + tag if tag else ''), {c for _, _, c, _ in found})
         # GLSLC outputs the game compiles at run time, captured on the Mac (hle_glslc.c): <version dir>/glslc_capture, or DM_GLSLC_CAPTURE. A game needs them when main holds GLSL sources and
         # calls glslcCompile in a module it loads (Fire Emblem: Three Houses; profile_guess.py shader_sources). Captain Toad: Treasure Tracker imports it with agl's GLSL sources, but no module defines it
