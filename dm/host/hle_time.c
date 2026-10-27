@@ -68,6 +68,7 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18Sy
         if (fixed_time() < 0) { struct timespec w; clock_gettime(CLOCK_REALTIME, &w);   // the offset to the nearest second (whole seconds of the two clocks truncated apart flipped it by one)
             int64_t d_ns = (int64_t)w.tv_sec * 1000000000 + w.tv_nsec - steady_ns(); off = d_ns >= 0 ? (d_ns + 500000000) / 1000000000 : -((-d_ns + 500000000) / 1000000000); }
         memcpy(ctx, &off, 8); memcpy(ctx + 8, tp, 0x18);
+        if (fixed_time() < 0) memset(ctx + 8, 0, 8);   // the time point's seconds: one value in every run (see h_time_SnapCtx)
         if (made) LOG("time: host clock moved %+lld s against the guest ticks, new user clock context", (long long)(d - drift));
         drift = d; made = 1;
     }
@@ -118,28 +119,47 @@ HLE_FORCE("_ZN2nn4time28AdjustableNetworkSystemClock6AdjustEv", "adjust the netw
 // Arithmetic on two snapshots: the SDK hands both to the time service (a call through its session, AbortImpl when there is none: STEINS;GATE RE:BOOT's and Tears of the Kingdom's SDK;
 // Tears of the Kingdom imports both); the host computes what the service does (as Ryujinx's time service). TimeSpan is nanoseconds
 static int64_t snap64(const uint8_t *s, int off) { int64_t v; memcpy(&v, s + off, 8); return v; }
+static const char *t_where(uint64_t a, char *buf, size_t n) {   // a guest code address as module+offset, for the clock comparison log
+    for (int i = 0; i < g_nmod; i++) if (a >= (uint64_t)g_mod[i].base && a < (uint64_t)g_mod[i].base + g_mod[i].size) { snprintf(buf, n, "%s+%#llx", g_mod[i].name, (unsigned long long)(a - (uint64_t)g_mod[i].base)); return buf; }
+    snprintf(buf, n, "%#llx", (unsigned long long)a); return buf;
+}
 static int same_source(const uint8_t *a, const uint8_t *b, int tp) { return !memcmp(a + tp + 8, b + tp + 8, 16); }   // the source IDs of the steady time points at +tp
 // A snapshot a game saved before the steady clock ran from a real-time base holds uptime seconds (under 10^9; the real-time base puts the clock past 1.7 * 10^9): read as the user time it was
 // taken at (+0x40), what the steady clock now reads at that moment, and its context's offset (user time − steady time) as 0. Saves made before the change then compare as if made with today's clock
 static int64_t snap_steady(const uint8_t *s) { int64_t v = snap64(s, 0x90); return v < 1000000000 && snap64(s, 0x40) >= 1000000000 ? snap64(s, 0x40) : v; }
-static int64_t snap_offset(const uint8_t *s) { return snap64(s, 0x08) < 1000000000 && snap64(s, 0x40) >= 1000000000 ? 0 : snap64(s, 0x00); }
-HLE_FORCE("_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_", "span between two snapshots (time service): their steady time points, else their network times",
-          Result, h_time_SpanBetween, int64_t *out, const uint8_t *a, const uint8_t *b) {
+static int64_t snap_offset(const uint8_t *s) { return snap64(s, 0x90) < 1000000000 && snap64(s, 0x40) >= 1000000000 ? 0 : snap64(s, 0x00); }   // old: its steady reading (+0x90) in uptime seconds
+// It returns a bool, true when the span could be worked out (the SDK's own ends with cset w0, eq: SDK 16 Wonder, 20 Tears of the Kingdom and Tomodachi Life). Answered as a Result (0 on success) it read
+// as false every time: Tomodachi Life: Living the Dream tests bit 0 (main+0x871410) and said at every start that the system time had changed since it last played
+HLE_FORCE("_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_", "span between two snapshots (time service): their steady time points, else their network times; true when found",
+          int, h_time_SpanBetween, int64_t *out, const uint8_t *a, const uint8_t *b) {
     int64_t s;
     if (same_source(a, b, 0x90)) s = snap_steady(b) - snap_steady(a);
     else if (snap64(a, 0x48) && snap64(b, 0x48)) s = snap64(b, 0x48) - snap64(a, 0x48);
-    else { static int nf; if (nf++ < 8) LOG("time: span between snapshots: no common clock (steady sources differ, no network time)"); return RES_FAIL; }   // the service answers "not found", *out untouched (as the SDK leaves it)
-    static int n; if (n++ < 8) LOG("time: span between snapshots: steady %lld → %lld (%s), %lld s", (long long)snap_steady(a), (long long)snap_steady(b), same_source(a, b, 0x90) ? "same source" : "network times", (long long)s);
-    *out = s * 1000000000; return RES_OK;
+    else { static int nf; if (nf++ < 8) LOG("time: span between snapshots: no common clock (steady sources differ, no network time)"); return 0; }   // the service answers "not found", *out untouched (as the SDK leaves it)
+    static int n; char w[64]; if (n++ < 8) LOG("time: span between snapshots (at %s): steady %lld → %lld (%s), %lld s", t_where((uint64_t)__builtin_return_address(0), w, sizeof w), (long long)snap_steady(a), (long long)snap_steady(b), same_source(a, b, 0x90) ? "same source" : "network times", (long long)s);
+    *out = s * 1000000000; return 1;
 }
 // How far the user moved the user clock between two snapshots (asked at Pokémon: Let's Go's first save, PR #36): the change of the user clock offset, 0 when the two contexts' steady
 // sources differ or both snapshots have automatic correction on. The snapshots carry h_time_GetContext's context, renewed when the host clock is set, so that shows up here
 HLE_FORCE("_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_", "user clock change between two snapshots (time service): from their user clock offsets",
           int64_t, h_time_UserDiff, const uint8_t *a, const uint8_t *b) {
     int64_t r = !same_source(a, b, 0x08) || (a[0xcc] && b[0xcc]) ? 0 : (snap_offset(b) - snap_offset(a)) * 1000000000;
-    static int n; if (n++ < 8) LOG("time: user clock change between snapshots: offsets %lld → %lld, steady sources %s, user times %lld → %lld: %lld s", (long long)snap_offset(a), (long long)snap_offset(b),
+    static int n; char w[64]; if (n++ < 8) LOG("time: user clock change between snapshots (at %s): offsets %lld → %lld, steady sources %s, user times %lld → %lld: %lld s", t_where((uint64_t)__builtin_return_address(0), w, sizeof w), (long long)snap_offset(a), (long long)snap_offset(b),
                                    same_source(a, b, 0x08) ? "the same" : "differ", (long long)snap64(a, 0x40), (long long)snap64(b, 0x40), (long long)(r / 1000000000));
     return r;
+}
+// The user clock context a snapshot carries, as games read it to notice the clock being set: Tomodachi Life: Living the Dream compares the one in its save with a new snapshot's at every start
+// ("Your system time has changed since the last time you played"). A Switch's context changes only when the clock is set; the host's held the steady time point of the run's first context, a new
+// value at every start. The host's contexts now carry time point seconds 0 (h_time_GetContext), and a snapshot of the host's steady clock is read back the same way, with its offset as
+// snap_offset reads it: snapshots saved by earlier runs then compare equal unless the clock was really set between them
+typedef struct { uint8_t b[0x20]; } SystemClockContext;
+HLE_FORCE("_ZNK2nn4time13ClockSnapshot33GetStandardUserSystemClockContextEv", "the snapshot's user clock context, its time point as the host's contexts carry it (one value in every run)",
+          SystemClockContext, h_time_SnapCtx, const uint8_t *snap) {
+    SystemClockContext c; memcpy(c.b, snap, 0x20);
+    if (fixed_time() < 0 && !memcmp(snap + 0x10, "dmhost-steady-01", 16)) { int64_t off = snap_offset(snap); memcpy(c.b, &off, 8); memset(c.b + 8, 0, 8); }
+    static int n; char w[64]; if (n++ < 12) LOG("time: snapshot context read at %s: stored offset %lld time point %lld, given offset %lld time point %lld (snapshot user time %lld, steady %lld)",
+        t_where((uint64_t)__builtin_return_address(0), w, sizeof w), (long long)snap64(snap, 0), (long long)snap64(snap, 8), (long long)*(int64_t *)c.b, (long long)*(int64_t *)(c.b + 8), (long long)snap64(snap, 0x40), (long long)snap64(snap, 0x90));
+    return c;
 }
 // The reverse: local calendar → absolute seconds (13 Sentinels). Around a daylight-saving switch one local time maps to 0 or 2 absolute seconds; the host's mktime gives one
 HLE_FORCE("_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeE",
