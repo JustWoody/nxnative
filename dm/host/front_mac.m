@@ -357,6 +357,10 @@ static void pads_start(void) {
 - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
 @end
 
+// A quit through exit() (⌘Q, Quit game, Restart now, the window closed, the game ending) says so in the log; a crash leaves through _exit (crash.c) and does not.
+// The launcher's settings safety net (switchports/safe_launch.py) counts a trial run that ended this way as good
+static void exit_log(void) { LOG("exit: the app quit normally"); }
+
 typedef struct { void (*fn)(void); } guest_arg;
 static void *guest_tramp(void *p) {
     static char alt[65536];                       // The signal alternate stack is per thread; crash printing must also work on the guest thread
@@ -369,6 +373,7 @@ __attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
+    atexit(exit_log);
     if (!getenv("DM_WINDOW")) { guest(); return; }
     @autoreleasepool {
         [NSApplication sharedApplication];
