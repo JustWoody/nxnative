@@ -410,6 +410,15 @@ void front_run(void (*guest)(void)) {
         dm_haptics_apple_init();
         pads_start();
         if (getenv("DM_AUTO_HDR") && atoi(getenv("DM_AUTO_HDR")) > 0) hdr_apply(atoi(getenv("DM_AUTO_HDR")));   // Auto HDR from the start (the in-game menu sets it)
+        // The pointer hides in fullscreen once the mouse has kept still for DM_CURSOR_HIDE seconds (default 3, 0 = never) and shows again as it moves (AppKit's
+        // hidden-until-moved); not while a button is held, as the mouse is the touchscreen
+        static NSPoint last_at; static double still; static int hidden;
+        const char *ch = getenv("DM_CURSOR_HIDE"); double hide_after = ch ? atof(ch) : 3;
+        if (hide_after > 0) [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { (void)t;
+            NSPoint at = NSEvent.mouseLocation;
+            if (!NSEqualPoints(at, last_at) || g_mouse_down || !(win.styleMask & NSWindowStyleMaskFullScreen) || !win.isKeyWindow) { last_at = at; still = 0; hidden = 0; return; }
+            if ((still += 0.5) >= hide_after && !hidden) { [NSCursor setHiddenUntilMouseMoves:YES]; hidden = 1; }
+        }];
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
