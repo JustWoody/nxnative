@@ -2287,6 +2287,13 @@ static id<MTLTexture> tex_linear(const tex_t *t) {
     id<MTLBuffer> b = (__bridge id<MTLBuffer>)mb;
     NSUInteger al = [g_dev minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf];
     if (mo % al || row % al) { RED_ONCE(65, "linear texture offset %#llx / row pitch %zu not aligned to %lu bytes; created as a private texture (CPU writes invisible)", (unsigned long long)mo, row, (unsigned long)al); return nil; }
+    // A format Metal holds wider than the game (Skyrim's new game: a 1280-wide linear texture of 3-byte pixels, rows of 3840 bytes, which Metal holds as 4-byte RGBA8 and so needs 5120):
+    // the game's rows cannot back a Metal texture (Metal's texture validation aborts the process); the texture is made the usual way, which converts its pixels on upload
+    size_t px = mtl_pf_bytes((MTLPixelFormat)pf);
+    if (px != (size_t)bpb || row < (size_t)(t->d.width ? t->d.width : 1) * px) {
+        static int once; if (!once++) MLOG("linear texture %ux%u format %#x: %d-byte pixels held as %zu-byte Metal pixels (rows of %zu bytes): made as an ordinary texture, its pixels converted on upload", t->d.width, t->d.height, t->d.format, bpb, px, row);
+        return nil;
+    }
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width ? t->d.width : 1 height:t->d.height ? t->d.height : 1 mipmapped:NO];
     d.resourceOptions = b.resourceOptions;
     d.usage = MTLTextureUsageShaderRead | img_usage(t, (MTLPixelFormat)pf) | (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET ? MTLTextureUsageRenderTarget : 0);
@@ -3089,7 +3096,7 @@ static int dsh_attach(MTLRenderPassAttachmentDescriptor *a, int slot) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.pixelFormat width:w height:h mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
         id<MTLTexture> sh = [g_dev newTextureWithDescriptor:d];
-        if (!sh) { RED_ONCE(90, "duplicate colour slot: cannot create its %lux%lu shadow (Metal format %lu); its writes are lost", (unsigned long)w, (unsigned long)h, (unsigned long)t.pixelFormat); return 0; }
+        if (!sh) { RED_ONCE(120, "duplicate colour slot: cannot create its %lux%lu shadow (Metal format %lu); its writes are lost", (unsigned long)w, (unsigned long)h, (unsigned long)t.pixelFormat); return 0; }
         if (g_dsh_sh[k]) defer_obj_release(g_dsh_sh[k]);
         res_add(sh); g_dsh_sh[k] = sh;
     }
@@ -3130,7 +3137,7 @@ static void dsh_flush(void) {   // after the pass: the duplicate slots' channels
             pd.colorAttachments[0].pixelFormat = e.tex.pixelFormat;
             pd.colorAttachments[0].writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
             NSError *err = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
-            if (!ps) { RED_ONCE(91, "duplicate colour slot: cannot create the merge pipeline for format %lu mask %#x: %s", (unsigned long)e.tex.pixelFormat, m, err.localizedDescription.UTF8String); continue; }
+            if (!ps) { RED_ONCE(121, "duplicate colour slot: cannot create the merge pipeline for format %lu mask %#x: %s", (unsigned long)e.tex.pixelFormat, m, err.localizedDescription.UTF8String); continue; }
             pso[pk] = ps;
         }
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
