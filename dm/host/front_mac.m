@@ -25,7 +25,7 @@ static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
 static int g_menu_open, g_menu_swallow, g_abxy = -2;   // the in-game menu (end of this file) is up; controller buttons held as it closed, kept from the game until released; DM_PAD_ABXY
-static int menu_key(unsigned short c, int down); static void menu_pad(uint64_t m, int32_t ly); static void menu_toggle(void); static void menu_home(void); static void hdr_apply(int lvl);
+static int menu_key(unsigned short c, int down); static void menu_pad(uint64_t m, int32_t ly); static void menu_toggle(void); static void menu_home(const char *from); static void hdr_apply(int lvl);
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
@@ -132,7 +132,11 @@ static int pad_by_label(GCController *c) {
         if ([s rangeOfString:n options:NSCaseInsensitiveSearch].location != NSNotFound) return 1;
     return 0;
 }
+static int home_ok(void) { return g_input_on || NSApp.isActive; }   // Home still works while something else of this app's (a system panel) holds the key window
 static void pad_read(GCExtendedGamepad *g) {
+    static int home_down; int home = g.buttonHome.isPressed;   // Home (a Pro Controller's, an 8BitDo's heart) opens and closes the in-game menu
+    if (home && !home_down && home_ok()) menu_home("controller");
+    home_down = home;
     if (!g_input_on) return;
     int p = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)g.controller); if (p < 0) return;
     dm_haptics_apple_controller(p, g.controller);
@@ -144,9 +148,6 @@ static void pad_read(GCExtendedGamepad *g) {
     K(g.buttonMenu, DM_BTN_PLUS); K(g.buttonOptions, DM_BTN_MINUS); K(g.leftThumbstickButton, DM_BTN_LS); K(g.rightThumbstickButton, DM_BTN_RS);   // nil on pads without them: not pressed
     K(g.dpad.left, DM_BTN_LEFT); K(g.dpad.up, DM_BTN_UP); K(g.dpad.right, DM_BTN_RIGHT); K(g.dpad.down, DM_BTN_DOWN);
     #undef K
-    static int home_down; int home = g.buttonHome.isPressed;   // Home (a Pro Controller's, an 8BitDo's heart) opens and closes the in-game menu
-    if (home && !home_down) menu_home();
-    home_down = home;
     if (g_menu_open) { menu_pad(m, pad_axis(g.leftThumbstick.yAxis.value)); return; }
     if (g_menu_swallow) { if (m) m = 0; else g_menu_swallow = 0; }   // the button that closed the menu does not reach the game
     dm_pad_set_player(p, m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
@@ -270,10 +271,11 @@ static int pro_player(void) {   // the player of the first Pro Controller GameCo
 }
 static void pro_report(void *ctx, IOReturn res, void *sender, IOHIDReportType type, uint32_t id, uint8_t *r, CFIndex len) {
     (void)ctx; (void)res; (void)sender; (void)type; (void)id;
-    if (!g_input_on || len < 49 || r[0] != 0x30) return;
+    if (len < 49 || r[0] != 0x30) return;
     static int home_down; int home = (r[4] & 0x10) != 0;   // byte 4: − + RS LS Home Capture; macOS does not pass a Pro Controller's Home to GameController
-    if (home && !home_down) menu_home();
+    if (home && !home_down && home_ok()) menu_home("Pro Controller report");
     home_down = home;
+    if (!g_input_on) return;
     if (g_menu_open || !g_gyro_state) return;
     static int first = 1;
     if (first) { first = 0; LOG("controller motion: reading the Pro Controller's own reports (HID 0x30)"); }
@@ -440,7 +442,9 @@ void front_run(void (*guest)(void)) {
         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
         [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
         [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
-        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); if (!win.miniaturized) dm_focus_set(2); }];
+        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n;
+            LOG("front end: the game window lost the keyboard (key window now %s, app %s)", NSApp.keyWindow ? NSApp.keyWindow.className.UTF8String : "none", NSApp.isActive ? "active" : "in the background");
+            input_release(); if (!win.miniaturized) dm_focus_set(2); }];
         [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_resume(); dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
@@ -796,10 +800,13 @@ static void menu_close(void) {
     LOG("in-game menu: closed");
 }
 static void menu_toggle(void) { if (g_menu_open) menu_leave(); else menu_open(); }
-static void menu_home(void) {   // Home from GameController or from the Pro Controller's reports, whichever comes first: one press toggles once
+static void menu_home(const char *from) {   // Home from GameController or from the Pro Controller's reports, whichever comes first: one press toggles once
     static uint64_t last; uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    if (now - last > 300000000ull) { if (g_confirm) { g_confirm = 0; menu_draw(); } else menu_toggle(); }
+    int act = now - last > 300000000ull;   // the other path's report of the same press comes within a few ms; only a press that acts restarts the wait
+    LOG("in-game menu: Home from %s (menu %s, game window %skey)%s", from, g_menu_open ? (g_confirm ? "asking" : "open") : "closed", g_win.isKeyWindow ? "" : "not ", act ? "" : ": same press, ignored");
+    if (!act) return;
     last = now;
+    if (g_confirm) { g_confirm = 0; menu_draw(); } else menu_toggle();
 }
 // A controller while the panel is up: each button and the stick act on their press (edge), not while held
 static void menu_pad(uint64_t m, int32_t ly) {
