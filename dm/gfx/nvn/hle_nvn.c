@@ -792,7 +792,21 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
     cmd_new_segment(CB(c), pl->mem + off, n);
     CB(c)->used = 0;   // GetCommandMemoryUsed counts from the start of the memory the game last added, across recordings (see there)
 }
-NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) { (void)c; (void)m; (void)n; }
+// Control memory: the host records nothing there, so a command buffer's free control memory is all the game last added (GetControlMemoryFree). Skyrim asks before each
+// recording (314 times in two minutes); unimplemented, the answer was 0. A side table rather than a cmd_t field: the game's inlined NVN code writes into the object itself
+enum { CTL_N = 256 };
+static struct { const void *cb; size_t n; } g_ctl[CTL_N]; static pthread_mutex_t g_ctl_mu = PTHREAD_MUTEX_INITIALIZER;
+NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
+    (void)m; pthread_mutex_lock(&g_ctl_mu);
+    int k = -1; for (int i = 0; i < CTL_N; i++) { if (g_ctl[i].cb == c) { k = i; break; } if (k < 0 && !g_ctl[i].cb) k = i; }
+    if (k >= 0) { g_ctl[k].cb = c; g_ctl[k].n = n; }
+    pthread_mutex_unlock(&g_ctl_mu);
+}
+NVN(nvnCommandBufferGetControlMemoryFree, size_t, const NVNcommandBuffer *c) {
+    size_t n = 0; pthread_mutex_lock(&g_ctl_mu);
+    for (int i = 0; i < CTL_N; i++) if (g_ctl[i].cb == c) { n = g_ctl[i].n; break; }
+    pthread_mutex_unlock(&g_ctl_mu); return n;
+}
 // Get space for one record and keep `keep` bytes after it (OP_RESERVE, 0 for the END); if not enough, call back into the game per the NVN convention to add command memory
 static uint8_t *cmd_alloc_keep(cmd_t *o, uint32_t size, uint32_t keep) {
     size = (size + 7) & ~7u;

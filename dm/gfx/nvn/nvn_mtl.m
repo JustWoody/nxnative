@@ -2289,10 +2289,27 @@ static id<MTLTexture> tex_linear(const tex_t *t) {
     if (mo % al || row % al) { RED_ONCE(65, "linear texture offset %#llx / row pitch %zu not aligned to %lu bytes; created as a private texture (CPU writes invisible)", (unsigned long long)mo, row, (unsigned long)al); return nil; }
     // A format Metal holds wider than the game (Skyrim's new game: a 1280-wide linear texture of 3-byte pixels, rows of 3840 bytes, which Metal holds as 4-byte RGBA8 and so needs 5120):
     // the game's rows cannot back a Metal texture (Metal's texture validation aborts the process); the texture is made the usual way, which converts its pixels on upload
-    size_t px = mtl_pf_bytes((MTLPixelFormat)pf);
-    if (px != (size_t)bpb || row < (size_t)(t->d.width ? t->d.width : 1) * px) {
+    size_t px = mtl_pf_bytes((MTLPixelFormat)pf), w = t->d.width ? t->d.width : 1, h = t->d.height ? t->d.height : 1;
+    if (px != (size_t)bpb) {
         static int once; if (!once++) MLOG("linear texture %ux%u format %#x: %d-byte pixels held as %zu-byte Metal pixels (rows of %zu bytes): made as an ordinary texture, its pixels converted on upload", t->d.width, t->d.height, t->d.format, bpb, px, row);
         return nil;
+    }
+    // A row stride shorter than the width needs (Skyrim's "how to hold the Joy-Con" picture: 1280x720 RGBA8 built with SetStride 3840): the GPU reads each row from row × y, the rows
+    // overlapping, and the game samples only the part it means. Metal refuses such a texture, and as an ordinary one its linear memory was read as block-linear (the picture came out
+    // purple). It is made as a texture of its own, filled from the pool as the GPU reads it: row y = the w × px bytes from row × y, the last ones cut at the storage's end
+    if (row < w * px) {
+        MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:w height:h mipmapped:NO];
+        sd.storageMode = MTLStorageModeShared; sd.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> tx = [g_dev newTextureWithDescriptor:sd];
+        uint8_t *img = tx ? calloc(w * px, h) : NULL; const uint8_t *src = (const uint8_t *)t->mem; size_t total = row * h;
+        if (!img) return nil;
+        for (size_t y = 0; y < h; y++) { size_t o = row * y, n = o >= total ? 0 : total - o < w * px ? total - o : w * px; if (n) memcpy(img + y * w * px, src + o, n); }
+        [tx replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:img bytesPerRow:w * px];
+        const char *dump = getenv("DM_NVN_LINDUMP");   // diagnostic: the picture as made, a raw RGBA file <path>_<w>x<h>.rgba
+        if (dump && *dump) { char fn[1024]; snprintf(fn, sizeof fn, "%s_%zux%zu.rgba", dump, w, h); FILE *f = fopen(fn, "wb"); if (f) { fwrite(img, w * px, h, f); fclose(f); } }
+        free(img);
+        static int once; if (!once++) MLOG("linear texture %zux%zu format %#x with rows of %zu bytes (fewer than its width's %zu): filled as the GPU reads it, rows %zu bytes apart", w, h, t->d.format, row, w * px, row);
+        return tx;
     }
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width ? t->d.width : 1 height:t->d.height ? t->d.height : 1 mipmapped:NO];
     d.resourceOptions = b.resourceOptions;
