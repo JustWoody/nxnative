@@ -119,20 +119,27 @@ HLE_FORCE("_ZN2nn4time28AdjustableNetworkSystemClock6AdjustEv", "adjust the netw
 // Tears of the Kingdom imports both); the host computes what the service does (as Ryujinx's time service). TimeSpan is nanoseconds
 static int64_t snap64(const uint8_t *s, int off) { int64_t v; memcpy(&v, s + off, 8); return v; }
 static int same_source(const uint8_t *a, const uint8_t *b, int tp) { return !memcmp(a + tp + 8, b + tp + 8, 16); }   // the source IDs of the steady time points at +tp
+// A snapshot a game saved before the steady clock ran from a real-time base holds uptime seconds (under 10^9; the real-time base puts the clock past 1.7 * 10^9): read as the user time it was
+// taken at (+0x40), what the steady clock now reads at that moment, and its context's offset (user time − steady time) as 0. Saves made before the change then compare as if made with today's clock
+static int64_t snap_steady(const uint8_t *s) { int64_t v = snap64(s, 0x90); return v < 1000000000 && snap64(s, 0x40) >= 1000000000 ? snap64(s, 0x40) : v; }
+static int64_t snap_offset(const uint8_t *s) { return snap64(s, 0x08) < 1000000000 && snap64(s, 0x40) >= 1000000000 ? 0 : snap64(s, 0x00); }
 HLE_FORCE("_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_", "span between two snapshots (time service): their steady time points, else their network times",
           Result, h_time_SpanBetween, int64_t *out, const uint8_t *a, const uint8_t *b) {
     int64_t s;
-    if (same_source(a, b, 0x90)) s = snap64(b, 0x90) - snap64(a, 0x90);
+    if (same_source(a, b, 0x90)) s = snap_steady(b) - snap_steady(a);
     else if (snap64(a, 0x48) && snap64(b, 0x48)) s = snap64(b, 0x48) - snap64(a, 0x48);
-    else return RES_FAIL;   // no common clock: the service answers "not found", *out untouched (as the SDK leaves it)
+    else { static int nf; if (nf++ < 8) LOG("time: span between snapshots: no common clock (steady sources differ, no network time)"); return RES_FAIL; }   // the service answers "not found", *out untouched (as the SDK leaves it)
+    static int n; if (n++ < 8) LOG("time: span between snapshots: steady %lld → %lld (%s), %lld s", (long long)snap_steady(a), (long long)snap_steady(b), same_source(a, b, 0x90) ? "same source" : "network times", (long long)s);
     *out = s * 1000000000; return RES_OK;
 }
 // How far the user moved the user clock between two snapshots (asked at Pokémon: Let's Go's first save, PR #36): the change of the user clock offset, 0 when the two contexts' steady
 // sources differ or both snapshots have automatic correction on. The snapshots carry h_time_GetContext's context, renewed when the host clock is set, so that shows up here
 HLE_FORCE("_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_", "user clock change between two snapshots (time service): from their user clock offsets",
           int64_t, h_time_UserDiff, const uint8_t *a, const uint8_t *b) {
-    if (!same_source(a, b, 0x08) || (a[0xcc] && b[0xcc])) return 0;
-    return (snap64(b, 0x00) - snap64(a, 0x00)) * 1000000000;
+    int64_t r = !same_source(a, b, 0x08) || (a[0xcc] && b[0xcc]) ? 0 : (snap_offset(b) - snap_offset(a)) * 1000000000;
+    static int n; if (n++ < 8) LOG("time: user clock change between snapshots: offsets %lld → %lld, steady sources %s, user times %lld → %lld: %lld s", (long long)snap_offset(a), (long long)snap_offset(b),
+                                   same_source(a, b, 0x08) ? "the same" : "differ", (long long)snap64(a, 0x40), (long long)snap64(b, 0x40), (long long)(r / 1000000000));
+    return r;
 }
 // The reverse: local calendar → absolute seconds (13 Sentinels). Around a daylight-saving switch one local time maps to 0 or 2 absolute seconds; the host's mktime gives one
 HLE_FORCE("_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeE",
