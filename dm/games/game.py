@@ -105,6 +105,8 @@ def header(g):
     if p4 not in ('on', 'off'): sys.exit(f'{g.id}: pso_mtl4 must be on or off: {p4}')
     cp = g.get('core_preempt', 'off')   # same-core preemption approximation (hle_thread.c): on / off
     if cp not in ('on', 'off'): sys.exit(f'{g.id}: core_preempt must be on or off: {cp}')
+    dss = g.get('dup_slot_shadow', 'off')   # every duplicate colour slot drawn into a shadow from the start, not from its first write (nvn_mtl.m dsh_attach): on / off
+    if dss not in ('on', 'off'): sys.exit(f'{g.id}: dup_slot_shadow must be on or off: {dss}')
     fel = g.get('font_engine_lock', 'off')   # nn::fontll::ScalableFontEngine used by one thread at a time, each until its next SVC or wait (hle_fontll.c): on / off
     if fel not in ('on', 'off'): sys.exit(f'{g.id}: font_engine_lock must be on or off: {fel}')
     aba = g.get('alloc_big_align', 'off')   # nn::mem::StandardAllocator::Allocate aligns blocks of 64 KB or more to 64 KB (hle_os.c; Vanillaware's memory pool storage): on / off
@@ -160,6 +162,7 @@ def header(g):
          f'#define DM_GAME_PRESENT_DISPLAY {int(pi == "display")}',
          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
          f'#define DM_GAME_FONT_ENGINE_LOCK {int(fel == "on")}',
+         f'#define DM_GAME_DUP_SLOT_SHADOW {int(dss == "on")}',
          f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
          f'#define DM_GAME_FPS_TARGET {int(ft)}',
          f'#define DM_GAME_FPS_HOLD {int(fh == "on")}',

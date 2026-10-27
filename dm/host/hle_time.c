@@ -4,6 +4,7 @@
 #include "hle.h"
 #include <stdatomic.h>
 #include <time.h>
+#include <pthread.h>
 
 typedef struct { int16_t year; int8_t month, day, hour, minute, second; int8_t pad; } CalendarTime;
 typedef struct { uint32_t wday, yday; char tzname[8]; uint32_t dst; int32_t offset; } CalendarAdditionalInfo;
@@ -17,9 +18,21 @@ static int64_t fixed_time(void) {
 }
 HLE_FORCE("_ZN2nn4time10InitializeEv", "connect to the time service; clocks come from the host system time instead", Result, h_time_Initialize, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn4time13IsInitializedEv", "the time service is taken over, always initialized", int, h_time_IsInitialized, void) { return 1; }
-// Steady clock (seconds since boot + a clock source ID, a 16-byte UUID): the host's monotonic seconds with a fixed source ID. GetSpanBetween runs as is in sdk: it subtracts only when the source IDs match
-HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock → host monotonic clock (seconds), fixed source ID", Result, h_time_SteadyNow, uint8_t *out) {
-    int64_t s = (int64_t)(clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000000000ull);
+// Steady clock (seconds + a clock source ID, a 16-byte UUID): the host's monotonic clock from a base taken from the real-time clock once per run, with a fixed source ID. A Switch's steady clock
+// runs on through power-offs (only a lost RTC gives it a new source ID), so it is the same clock in every session: a game that saved a snapshot works out the time it was away from (CalculateSpanBetween),
+// and the user clock context's offset (user time − steady time) stays where it was unless the clock is set. The uptime the host used before restarted at every Mac restart and moved the offset by hours,
+// and its whole seconds (time() less truncated uptime seconds) moved it by a second between runs: Tomodachi Life: Living the Dream said at every start that the clock had been changed
+// (CalculateStandardUserSystemClockDifferenceByUser). GetSpanBetween runs as is in sdk: it subtracts only when the source IDs match. DM_FIXED_TIME keeps plain uptime seconds (deterministic runs)
+static int64_t steady_ns(void) {
+    static int64_t base = INT64_MIN; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    int64_t mono = (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (base == INT64_MIN) { pthread_mutex_lock(&mu);
+        if (base == INT64_MIN) { struct timespec w; clock_gettime(CLOCK_REALTIME, &w); base = fixed_time() >= 0 ? 0 : (int64_t)w.tv_sec * 1000000000 + w.tv_nsec - mono; }
+        pthread_mutex_unlock(&mu); }
+    return base + mono;
+}
+HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock → host monotonic clock from a real-time base (seconds), fixed source ID", Result, h_time_SteadyNow, uint8_t *out) {
+    int64_t s = steady_ns() / 1000000000;
     memcpy(out, &s, 8); memcpy(out + 8, "dmhost-steady-01", 16); return RES_OK;
 }
 HLE_FORCE("_ZN2nn4time38GetStandardSteadyClockCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock (the free function form, SDK 20) → host monotonic clock", Result, h_time_SteadyNowFn, uint8_t *out) { return h_time_SteadyNow(out); }
@@ -51,7 +64,10 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18Sy
     int64_t d = now - (int64_t)(guest_ns() / 1000000000ull);
     pthread_mutex_lock(&mu);
     if (!made || (fixed_time() < 0 && llabs(d - drift) > 1)) {
-        int64_t off = now - *(const int64_t *)tp; memcpy(ctx, &off, 8); memcpy(ctx + 8, tp, 0x18);
+        int64_t off = now - *(const int64_t *)tp;
+        if (fixed_time() < 0) { struct timespec w; clock_gettime(CLOCK_REALTIME, &w);   // the offset to the nearest second (whole seconds of the two clocks truncated apart flipped it by one)
+            int64_t d_ns = (int64_t)w.tv_sec * 1000000000 + w.tv_nsec - steady_ns(); off = d_ns >= 0 ? (d_ns + 500000000) / 1000000000 : -((-d_ns + 500000000) / 1000000000); }
+        memcpy(ctx, &off, 8); memcpy(ctx + 8, tp, 0x18);
         if (made) LOG("time: host clock moved %+lld s against the guest ticks, new user clock context", (long long)(d - drift));
         drift = d; made = 1;
     }
