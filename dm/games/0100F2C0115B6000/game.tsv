@@ -49,3 +49,5 @@ fps_target	60
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/ApplicationPackage=layout /Shader/=shader /Effect/=effect /UI/=layout
 shader_note	Tears of the Kingdom shaders
+# pl::IsRunningOnOunce feeds a flag kept beside its add-on content check (main+0xb620ac, read at +0xb162c4 and +0xb4d388): most likely the Switch 2 Edition upgrade; its Switch 2 improvements are in that separate program, so no menu line
+switch2_mode	off

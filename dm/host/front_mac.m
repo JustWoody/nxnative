@@ -674,6 +674,12 @@ static void menu_build(void) {
         if (!v) { for (int p = 0; p < DM_PLAYERS; p++) dm_pad_motion_gone(p); }
         else { for (GCController *c in GCController.controllers) motion_on(c); if (!g_hid) pro_hid_start(); }
         settings_put(@"DM_GYRO", v ? nil : @"0"); });
+    if (DM_GAME_SWITCH2_MODE && dm_main_imports("_ZN2nn2pl16IsRunningOnOunceEv")) {   // the game asks whether it runs on a Switch 2 and its profile offers the answer (hle_sdk16.c h_pl_IsOunce); read as it starts
+        const char *e = getenv("DM_OUNCE"); int now = e ? atoi(e) != 0 : DM_GAME_SWITCH2_MODE == 2, dflt = DM_GAME_SWITCH2_MODE == 2;
+        static int ounce = -1; if (ounce < 0) ounce = now;
+        DmMenuRow *sw2 = row(@"Game", @"Switch 2 mode", onoff, ^int { return ounce; }, ^(int v) { ounce = v; settings_put(@"DM_OUNCE", v == dflt ? nil : v ? @"1" : @"0"); });
+        sw2.restart = 1; sw2.initial = now;
+    }
     menu_game_settings(@"Game");
     abxy_init();
     row(@"Controls", @"A B X Y buttons", @[@"Automatic", @"By label", @"By position"], ^int { return g_abxy < 0 ? 0 : g_abxy ? 1 : 2; }, ^(int v) {

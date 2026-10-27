@@ -151,8 +151,13 @@ HLE_FORCE("_ZN2nn2pl13GetSharedFontEPiPNS0_14SharedFontDataEiNS_8settings12Langu
     }
     *count = n; return n > 0;
 }
-// Whether running on a Switch 2 (codename Ounce) (returns bool): the host reports false, as a Switch 1. Mario 1.2.1 uses it to decide whether to count add-on content (the upgrade pack) and suggest the Switch 2 Edition
-HLE_FORCE("_ZN2nn2pl16IsRunningOnOunceEv", "running on Switch 2: no", unsigned, h_pl_IsOunce, void) { return 0; }
+// Whether running on a Switch 2 (codename Ounce) (returns bool): the host reports false, as a Switch 1, unless Switch 2 mode is on (game profile switch2_mode; the Mac in-game menu sets DM_OUNCE). Tomodachi Life renders its 3D scenes docked at 1920x1080 instead of 1280x720 (main+0x481b94); among the games whose main imports this:
+// Super Mario Bros. Wonder 1.2.1, Tears of the Kingdom 1.4.3, Tomodachi Life: Living the Dream 1.0.4). Mario 1.2.1 uses it to decide whether to count add-on content (the upgrade pack) and suggest the Switch 2 Edition
+HLE_FORCE("_ZN2nn2pl16IsRunningOnOunceEv", "running on Switch 2: no, or yes with DM_OUNCE=1", unsigned, h_pl_IsOunce, void) {
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_OUNCE"); v = e ? atoi(e) != 0 : DM_GAME_SWITCH2_MODE == 2;   // the profile's switch2_mode on: yes unless the menu set DM_OUNCE=0
+        LOG("pl::IsRunningOnOunce: %s", v ? "yes, a Switch 2 (Switch 2 mode)" : "no, a Switch 1"); }
+    return (unsigned)v;
+}
 // The Legend of Zelda: Breath of the Wild (SDK 20): asks for the shared fonts to be loaded before querying their state; the host's stand-in fonts are there on demand. VR mode (the Labo VR goggles): the host never enters VR; the query is always false, entering / leaving is a no-op
 HLE_FORCE("_ZN2nn2pl21RequestSharedFontLoadENS0_14SharedFontTypeE", "request shared font load; the stand-in font is always available, no-op", void, h_pl_ReqLoad, int type) { (void)type; }
 HLE_FORCE("_ZN2nn2pl8IsVrModeEv", "VR mode: no", unsigned, h_pl_IsVr, void) { return 0; }

@@ -43,3 +43,5 @@ render_cond	on
 font_engine_lock	on
 # Its face / icon passes write alpha through a second slot holding the same texture (nvn_mtl.m dsh_attach): shadows from the first pass
 dup_slot_shadow	on
+# A Switch 2 answer (pl::IsRunningOnOunce) renders the 3D scenes docked at 1920x1080 instead of 1280x720 (main+0x481b94)
+switch2_mode	on
