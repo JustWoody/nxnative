@@ -619,7 +619,7 @@ static void menu_restart(void) {   // starts the app again a moment after this p
 }
 // The game's own player settings (Resources/game/launcher.json, written by switchports/game_settings.py from nxnative's settings.tsv: the rows that apply to this game, as
 // the iOS launcher shows them). The host reads them as the game starts, so each takes a restart; the ones this menu changes live (console mode, upscaling, the HUD) are
-// left out. Frame rate gets 120 fps on a screen that shows 120 Hz: nxnative paces those games itself (fps_target), so the game keeps its speed; it also sets the 120 Hz link
+// left out. Frame rate offers the game's own choices only: the frame step holds whole 60 Hz vsyncs, so 120 fps would run nothing faster (it once offered 120: Tears of the Kingdom fell back to 30)
 static NSArray *g_game_settings;
 static void menu_game_settings(NSString *section) {
     if (!g_game_settings) {
@@ -639,7 +639,6 @@ static void menu_game_settings(NSString *section) {
             for (double v = lo; v <= hi + step / 2; v += step) { [vals addObject:[NSString stringWithFormat:@"%g", round(v * 1000) / 1000]]; [labels addObject:[NSString stringWithFormat:@"%.0f%%", v * 100]]; }
         } else continue;
         int fps = [env isEqualToString:@"DM_FPS_TARGET"];
-        if (fps && g_screen_fps >= 120 && ![vals containsObject:@"120"]) { [vals addObject:@"120"]; [labels addObject:@"120 fps"]; }
         const char *cur = getenv(env.UTF8String); NSString *now = cur ? @(cur) : def;
         int init = 0; double best = INFINITY;
         for (int i = 0; i < (int)vals.count; i++) { double dd = fabs(vals[i].doubleValue - now.doubleValue); if ([vals[i] isEqualToString:now]) { best = -1; init = i; break; } if (dd < best) { best = dd; init = i; } }
@@ -648,7 +647,7 @@ static void menu_game_settings(NSString *section) {
         DmMenuRow *r = row(section, label, labels, ^int { return pick[env].intValue; }, ^(int v) {
             pick[env] = @(v); NSString *val = vals[v];
             settings_put(env, [val isEqualToString:def] ? nil : val);
-            if (fps) { int hi = val.intValue > 60; settings_put(@"DM_PRESENT_HZ", hi ? val : nil); settings_put(@"DM_PRESENT_LINK", hi ? @"2" : nil); }
+            if (fps) { settings_put(@"DM_PRESENT_HZ", nil); settings_put(@"DM_PRESENT_LINK", nil); }   // a 120 fps choice from before: the frame step holds whole 60 Hz vsyncs (loader.c caps it at 60)
         });
         r.restart = 1; r.initial = init;
     }
