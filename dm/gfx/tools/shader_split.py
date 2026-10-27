@@ -1723,6 +1723,53 @@ def unity_text_glslc(x, base):
         if b'\x91\x68\x86\x19' in b: out += glslc_shaders(b, f'{base}#{name}', need=False)
     return out
 
+BSA = b'BSA\0'
+def bsa_members(path, want):
+    """Bethesda's BSA archive (version 104, Skyrim; 105, Skyrim Special Edition and the Switch's) → [(member path, bytes)] of the members whose path want(path) takes, read through the archive's index
+    (the Switch's Skyrim has 12 GB of them; its shaders are one member of 'Skyrim - Shaders.bsa'). Header: magic, version, folder records offset, archive flags (1 folder names, 2 file names,
+    4 compressed by default, 0x100 each member's path before its data), folder count, file count, folder names length, file names length, file flags. Folder records are 16 bytes in 104
+    {hash u64, count u32, offset u32} and 24 in 105 {hash u64, count u32, u32, offset u64}; then for each folder its name (a length byte, the name with its 0) and its file records
+    {hash u64, size u32 (bit 30 flips the archive's compression), offset u32}, then the file names, each ending with a 0. A compressed member is its original size (u32), then zlib (104)
+    or an LZ4 frame (105)"""
+    out = []
+    with open(path, 'rb') as f:
+        head = f.read(36)
+        _, ver, off, flags, nfold, nfile, _, lfile = struct.unpack_from('<4sIIIIIII', head)
+        if ver not in (104, 105): print(f'[RED] {path}: BSA version {ver}, not 104 or 105: not read', flush=True); return out
+        f.seek(off); counts = [struct.unpack('<QI4xQ' if ver == 105 else '<QII', f.read(24 if ver == 105 else 16))[1] for _ in range(nfold)]
+        recs = []
+        for n in counts:
+            folder = f.read(f.read(1)[0]).rstrip(b'\0').decode('latin-1') if flags & 1 else ''
+            recs += [(folder, *struct.unpack('<8xII', f.read(16))) for _ in range(n)]
+        names = f.read(lfile).split(b'\0') if flags & 2 else [b''] * len(recs)
+        for (folder, size, at), nm in zip(recs, names):
+            member = (folder + '\\' + nm.decode('latin-1')).replace('\\', '/').lower()
+            if not want(member): continue
+            f.seek(at); n = size & 0x3fffffff
+            if flags & 0x100: k = f.read(1)[0]; f.read(k); n -= 1 + k   # the member's path before its data
+            data = f.read(n)
+            if bool(flags & 4) != bool(size & 0x40000000):   # compressed
+                if ver == 104: import zlib; data = zlib.decompress(data[4:])
+                else: import lz4.frame; data = lz4.frame.decompress(data[4:])
+            out.append((member, data))
+    return out
+
+def fxp_shaders(d, label):
+    """Bethesda's shader file (the Switch's Skyrim: shadersfx/shaders011.fxp, the one member of 'Skyrim - Shaders.bsa', 23,063 graphics and 19 compute shaders): records of a 0x40-byte header
+    (u32 2, 2, magic 0x11223344, …) and the NVN control section, followed right after it by its code area (the control section's +0x704 gives the code area's length). Which vertex and
+    pixel shaders draw together is not recorded, so each is a program of one stage (SINGLE_STAGE) paired by cover, as GLSLC outputs are"""
+    out, bad = [], 0
+    for m in re.finditer(re.escape(CTL_MAGIC), d):
+        c = m.start()
+        if c & 3 or c + 0x708 > len(d): continue
+        nctl, n = struct.unpack_from('<I', d, c + 0x20)[0], struct.unpack_from('<I', d, c + 0x704)[0]
+        ctl, code = d[c:c + nctl], d[c + nctl:c + nctl + n]
+        st = glslc_stage(ctl, code) if len(code) == n and CTL_MAGIC not in code else None
+        if st and not check(label, st, ctl, code): out.append((f'{label}#BTH@{c:#x}', st, ctl, code))
+        else: bad += 1
+    if bad: print(f'[RED] {label}: {bad} control sections without a code area that passes the checks right after them; left out', flush=True)
+    return out
+
 def scan_blob(d, label, out):
     if d[:4] == b'Yaz0': d = yaz0(d)
     if d[:4] == b'SARC':
@@ -1753,10 +1800,10 @@ def ps_inputs(code):
     """Generic attributes a pixel shader reads: SPH words 6–13 are the input map, 8 bits for each of the 32 attributes (Ryujinx ShaderHeader.ImapTypes), non-zero = read; the translated MSL inputs are exactly user(locn<attribute>)"""
     return {i for i in range(32) if struct.unpack_from('<I', code, 0x30 + 4 * (6 + (i >> 2)))[0] >> ((i & 3) * 8) & 0xff}
 
-SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#BTH@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
-# (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; and YEBIS's effect file (tfxo_shaders)
+# (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; YEBIS's effect file (tfxo_shaders); and Bethesda's shader file (Skyrim, fxp_shaders)
 def separable_pairs(keys):
     """Single-stage programs (13 Sentinels: each GLSLC output becomes a program with one stage, and BindProgram's stage bits combine vertex and pixel programs per draw; Unreal combines its shaders per draw
     from the pipeline state) have their real pairs only at draw time. vs_pad uses only the union of the locations the paired pixel shaders read, so every single-stage vertex shader is paired with
@@ -1815,6 +1862,9 @@ def scan_file(args):
     if ext in ('.data', '.patch', '.debug', '.nxpc') and os.path.exists(stem + '.dict'): return rel, {}, set(), {}   # read through its Next Level Games index (nlg_shaders)
     with open(path, 'rb') as f: head = f.read(16)
     found = []; trees = {}
+    if head[:4] == BSA:   # a Bethesda archive (bsa_members): only its shader files (.fxp) are read
+        for nm, m in bsa_members(path, lambda n: n.endswith('.fxp')): found += fxp_shaders(m, f'/{rel}/{nm}')
+        return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == NLG_DICT:
         nlg_shaders(path, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
