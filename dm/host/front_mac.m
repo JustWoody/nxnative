@@ -25,7 +25,8 @@ static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
 static int g_menu_open, g_menu_swallow, g_abxy = -2;   // the in-game menu (end of this file) is up; controller buttons held as it closed, kept from the game until released; DM_PAD_ABXY
-static int menu_key(unsigned short c, int down); static void menu_pad(uint64_t m, int32_t ly); static void menu_toggle(void); static void menu_home(const char *from); static void hdr_apply(int lvl);
+static struct mp { const void *who; uint64_t prev; int prev_y; } g_mpad[8]; static int g_mpad_n;   // menu_pad's controllers (emptied by menu_open)
+static int menu_key(unsigned short c, int down); static void menu_pad(uint64_t m, int32_t ly, const void *who); static void menu_toggle(void); static void menu_home(const char *from); static void hdr_apply(int lvl);
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
@@ -148,7 +149,7 @@ static void pad_read(GCExtendedGamepad *g) {
     K(g.buttonMenu, DM_BTN_PLUS); K(g.buttonOptions, DM_BTN_MINUS); K(g.leftThumbstickButton, DM_BTN_LS); K(g.rightThumbstickButton, DM_BTN_RS);   // nil on pads without them: not pressed
     K(g.dpad.left, DM_BTN_LEFT); K(g.dpad.up, DM_BTN_UP); K(g.dpad.right, DM_BTN_RIGHT); K(g.dpad.down, DM_BTN_DOWN);
     #undef K
-    if (g_menu_open) { menu_pad(m, pad_axis(g.leftThumbstick.yAxis.value)); return; }
+    if (g_menu_open) { menu_pad(m, pad_axis(g.leftThumbstick.yAxis.value), (__bridge const void *)g.controller); return; }
     if (g_menu_swallow) { if (m) m = 0; else g_menu_swallow = 0; }   // the button that closed the menu does not reach the game
     dm_pad_set_player(p, m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
 }
@@ -790,7 +791,7 @@ static void menu_open(void) {
     g_btn = 0; g_w = g_a = g_s = g_d = 0; push();   // nothing the game was given stays pressed
     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
     for (int p = 0; p < DM_PLAYERS; p++) dm_pad_set_player(p, 0, 0, 0, 0, 0);
-    g_menu_open = 1; menu_build();
+    g_menu_open = 1; g_mpad_n = 0; menu_build();
     if (g_tab >= (int)menu_tabs().count) g_tab = 0;
     if (g_sel >= (int)g_rows.count || !(g_rows[g_sel].choices || g_rows[g_sel].act) || !menu_shows(g_rows[g_sel])) { g_sel = 0; if (!g_rows[0].choices || !menu_shows(g_rows[0])) menu_move(1); }
     NSView *cv = g_win.contentView;
@@ -814,11 +815,23 @@ static void menu_home(const char *from) {   // Home from GameController or from 
     last = now;
     if (g_confirm) { g_confirm = 0; menu_draw(); } else menu_toggle();
 }
-// A controller while the panel is up: each button and the stick act on their press (edge), not while held
-static void menu_pad(uint64_t m, int32_t ly) {
-    static uint64_t prev; static int prev_y;
-    uint64_t dn = m & ~prev; prev = m;
-    int y = ly > DM_STICK_MAX / 2 ? 1 : ly < -DM_STICK_MAX / 2 ? -1 : 0, ydn = y != prev_y ? y : 0; prev_y = y;
+// A controller while the panel is up: each button and the stick act on their press (edge), not while held. Edges are per controller, and a press another controller
+// made of the same button (or stick direction) in the last 150 ms is the same press: one Pro Controller on a USB cable and over Bluetooth at once is two GameController
+// controllers whose reports interleave, and with one shared previous state every press arrived twice (the user: "the menu seems to be seeing my buttons and movements twice")
+static void menu_pad(uint64_t m, int32_t ly, const void *who) {
+    enum { NC = 8 }; struct mp *c = g_mpad; int nc = g_mpad_n;
+    static double last_t[66]; static const void *last_who[66];   // per button bit, then stick up (64) and down (65): when it last acted and from which controller
+    int i = 0; while (i < nc && c[i].who != who) i++;
+    if (i == nc) { if (nc < NC) g_mpad_n = ++nc; else i = NC - 1; c[i].who = who; c[i].prev = m; c[i].prev_y = 0; }   // a controller's first report since the menu opened is its state, not a press
+    uint64_t dn = m & ~c[i].prev; c[i].prev = m;
+    int y = ly > DM_STICK_MAX / 2 ? 1 : ly < -DM_STICK_MAX / 2 ? -1 : 0, ydn = y != c[i].prev_y ? y : 0; c[i].prev_y = y;
+    double now = CFAbsoluteTimeGetCurrent();
+    for (int b = 0; b < 66; b++) {
+        int edge = b < 64 ? (int)((dn >> b) & 1) : (b == 64 ? ydn > 0 : ydn < 0);
+        if (!edge) continue;
+        if (last_who[b] != who && now - last_t[b] < 0.15) { if (b < 64) dn &= ~(1ull << b); else ydn = 0; continue; }
+        last_t[b] = now; last_who[b] = who;
+    }
     if (g_confirm) {
         if ((dn & DM_BTN_UP) || ydn > 0) { g_csel = (g_csel + 2) % 3; menu_draw(); }
         if ((dn & DM_BTN_DOWN) || ydn < 0) { g_csel = (g_csel + 1) % 3; menu_draw(); }
