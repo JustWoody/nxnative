@@ -3332,8 +3332,9 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         uint64_t db = dt ? (comb ? whole / 5 * 4 : whole) : 0, sb = stt && stt != dt ? (comb ? whole / 5 : whole) : stt ? whole - db : 0;
         if (dt) { natt++; g_bw_store += db; if (pd.depthAttachment.loadAction == MTLLoadActionLoad) { g_bw_load += db; nload++; } }
         if (stt) { natt += !dt; g_bw_store += sb; if (pd.stencilAttachment.loadAction == MTLLoadActionLoad) { g_bw_load += sb; nload += !dt; } }
-        if (dt) PD("P %llu d ser=%llu fmt=%lu %lux%lu %s", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)dt.pixelFormat,
-                   (unsigned long)dt.width, (unsigned long)dt.height, pd.depthAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
+        if (dt) PD("P %llu d ser=%llu fmt=%lu %lux%lu lv%lu sl%lu %s view=%d layers=%d:%d+%d tex_mem=%p", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)dt.pixelFormat,
+                   (unsigned long)dt.width, (unsigned long)dt.height, (unsigned long)pd.depthAttachment.level, (unsigned long)pd.depthAttachment.slice, pd.depthAttachment.loadAction == MTLLoadActionClear ? "clear" : "load",
+                   R.rt.has_dview, R.rt.has_dview ? R.rt.dview.set_layers : 0, R.rt.has_dview ? R.rt.dview.min_layer : 0, R.rt.has_dview ? R.rt.dview.nlayers : 0, (void *)R.rt.depth->mem);
         else if (stt) PD("P %llu s ser=%llu fmt=%lu %lux%lu %s (stencil only)", g_stat_pass + 1, R.rt.depth->serial, (unsigned long)stt.pixelFormat,
                    (unsigned long)stt.width, (unsigned long)stt.height, pd.stencilAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
     }
@@ -6152,6 +6153,28 @@ static uint32_t g_dispatch_dim[3];   // the current dispatch's workgroup counts 
 static uint32_t g_draw_binst;   // the current draw's base instance (draw), for c0 + 0x644
 static __unsafe_unretained id<MTLBuffer> g_c0_dim_buf; static size_t g_c0_dim_off;   // where encode_args put them for this dispatch (nil: the shader reads no c0); an indirect dispatch copies its GPU-written counts there
 static uint64_t g_geo_bind[5];
+// Profile key cb_zero_tail (game.py: shader key:stage:slot:byte offset): that shader's uniform buffer is bound as a host copy of what the shader can read of it, zeroed from the offset on,
+// instead of the guest memory itself. The Elder Scrolls V: Skyrim's sun shadow mask (f8375e5ca87c959b, fragment stage, slot 0, 80 bytes bound) reads its per-cascade fade values from
+// bytes 64-79, which the game never fills: they are the start of the next block of its constant ring, different every frame, and the scene's lighting flipped between lit and
+// shadowed from frame to frame (Helgen Keep). Zero there applies each cascade's shadow as the shadow map gives it, steady. The copy is made when the pass is encoded and lives in a
+// 256-slot ring of 256-byte blocks (a block is used again 256 such draws later, long after the GPU has read it); the game's memory is not touched (the bytes belong to another block)
+static int cbz_bind(NvShader *sh, int stage, int reg, uint64_t addr, uint64_t len, uint64_t *slot) {
+    enum { N = 256, B = 256 };
+    static struct { char key[17]; int stage, reg, off; } e[8]; static int ne = -1; static id<MTLBuffer> ring; static unsigned next;
+    if (ne < 0) { ne = 0; for (const char *q = DM_GAME_CB_ZERO_TAIL; *q && ne < 8; ) { while (*q == ' ') q++; if (!*q) break;
+            if (sscanf(q, "%16[0-9a-f]:%d:%d:%d", e[ne].key, &e[ne].stage, &e[ne].reg, &e[ne].off) == 4) ne++; q += strcspn(q, " "); }
+        ring = [g_dev newBufferWithLength:N * B options:MTLResourceStorageModeShared]; res_add(ring);
+        MLOG("cb_zero_tail: %d uniform buffer%s bound as zero-tailed host copies (game profile)", ne, ne == 1 ? "" : "s"); }
+    for (int i = 0; i < ne; i++) {
+        if (e[i].stage != stage || e[i].reg != reg || strncmp(sh->key, e[i].key, strlen(e[i].key)) || len > B || (uint64_t)e[i].off >= len) continue;
+        uint8_t *dst = (uint8_t *)ring.contents + (size_t)(next % N) * B;
+        memcpy(dst, (const void *)addr, (size_t)e[i].off); memset(dst + e[i].off, 0, (size_t)(len - (uint64_t)e[i].off));
+        *slot = ring.gpuAddress + (uint64_t)(next % N) * B; next++;   // the ring is in the residency set (res_add)
+        { static int once; if (!once++) MLOG("cb_zero_tail: first copy, shader %s stage %d cb%d, %llu bytes, zero from byte %d", sh->key, stage, reg, (unsigned long long)len, e[i].off); }
+        return 1;
+    }
+    return 0;
+}
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex);
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) { AP_B; int r = encode_args_(en, sh, nvn_stage, metal_vertex); AP_E(3); return r; }
 static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
@@ -6180,6 +6203,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) {   // reads 0 (the all-zero bank), as an unbound texture slot does, instead of through a null pointer
                 RED_ONCE(16, "stage %d cb%d has no uniform buffer bound", nvn_stage, reg); slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); continue; }
             uint64_t ul = cb_len(sh, reg, u->size);   // what the shader can read of it
+            if (DM_GAME_CB_ZERO_TAIL[0] && cbz_bind(sh, nvn_stage, reg, u->addr, ul, &slots[aid])) continue;   // see cbz_bind
             if (g_nubd && ubd_hits(u->addr, u->addr + ul)) {   // inline updates deferred in this pass (see mtl_sub_update); ubd_conflict made sure they cover the binding or the rest can be read from memory
                 uint64_t g; const uint8_t *c; if (ubd_covers(u->addr, u->addr + ul)) gpu = ubd_shadow(u->addr, u->addr + ul);
                 else if (ubp_get(u->addr, u->addr + ul, &g, &c)) gpu = g;
@@ -8690,11 +8714,12 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (g_sm_pass && g_sm_applied != g_sm_cur) {   // the layer this draw goes to (see g_sm_plan)
         MTLVertexAmplificationViewMapping vm = {0, (uint32_t)(g_sm_cur - g_sm_lo)}; [(id<MTL4RenderCommandEncoder>)en setVertexAmplificationCount:1 viewMappings:&vm]; g_sm_applied = g_sm_cur; }
     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
-    // Diagnostic DM_NVN_DEPTHOVR=fragment shader key prefix,...: those draws compare depth with ALWAYS, which tells "the depth test rejects every fragment" from "nothing rasterizes" (with DM_NVN_HILITE); unset = unchanged
+    // Diagnostic DM_NVN_DEPTHOVR=fragment shader key prefix (vertex shader key for a draw without one),...: those draws compare depth with ALWAYS, which tells "the depth test rejects every fragment" from "nothing rasterizes" (with DM_NVN_HILITE); unset = unchanged
     static char dko[8][24]; static int ndko = -1;
     if (ndko < 0) { ndko = 0; const char *e = getenv("DM_NVN_DEPTHOVR");
         for (const char *q = e; q && *q && ndko < 8; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 23) n = 23; memcpy(dko[ndko], q, n); dko[ndko++][n] = 0; } }
-    if (ndko) { int ovr = 0; for (int i = 0; i < ndko && pr->sh[1]; i++) ovr |= !strncmp(pr->sh[1]->key, dko[i], strlen(dko[i]));
+    if (ndko) { int ovr = 0; NvShader *ks = pr->sh[1] ? pr->sh[1] : pr->sh[0];   // a draw without a fragment shader by its vertex shader's key
+        for (int i = 0; i < ndko && ks; i++) ovr |= !strncmp(ks->key, dko[i], strlen(dko[i]));
         unsigned df0 = (unsigned)S.ds.df; if (ovr) S.ds.df = 8; cur_ds = dss_get(g_pass.hd, g_pass.hs); S.ds.df = df0; cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
     else if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
     if (cur_ds != g_enc_dss) { enc_r_dss(en, cur_ds); g_enc_dss = cur_ds; }
@@ -9846,7 +9871,8 @@ void dm_gfx_texraw(uint64_t serial, const char *path) {
     id<MTLBuffer> buf = [g_dev newBufferWithLength:sz options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     MTLBlitOption bo = t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone;
-    [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:sz options:bo];
+    NSUInteger sl = getenv("DM_TEXRAW_SLICE") ? (NSUInteger)atoi(getenv("DM_TEXRAW_SLICE")) : 0; if (sl >= t.arrayLength) sl = 0;   // DM_CTL "env DM_TEXRAW_SLICE=n" first: that layer of an array
+    [b copyFromTexture:t sourceSlice:sl sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:sz options:bo];
     [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
     FILE *f = fopen(path, "wb"); if (f) { fprintf(f, "%lu %lu %lu %lu\n", (unsigned long)w, (unsigned long)h, (unsigned long)t.pixelFormat, (unsigned long)row); fwrite(buf.contents, 1, sz, f); fclose(f); }
     const uint8_t *p = buf.contents;

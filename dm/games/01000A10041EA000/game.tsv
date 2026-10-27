@@ -38,3 +38,5 @@ shader_groups	/Data/=data /BatchFiles/=batchfiles
 shader_note	The Elder Scrolls V: Skyrim shaders
 # A timestamp report writes 0 in its counter field, as the GPU does (nvn_mtl.m): the movie player clears its "GPU done" flags with ReportCounter and waited forever on the timestamp the host wrote
 render_cond	on
+# The sun shadow mask reads per-cascade fade values from bytes 64-79 of a uniform block the game fills only to byte 64 (leftovers, different every frame): the lighting flickered (nvn_mtl.m cbz_bind)
+cb_zero_tail	f8375e5ca87c959b:1:0:64
