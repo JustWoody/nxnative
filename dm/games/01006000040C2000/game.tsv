@@ -22,11 +22,13 @@ romfs_marker	PJ033/Content/Paks/PJ033-Switch.pak
 zip_store	.pak:.metallib
 
 # ---- Memory ----
-# main sets a heap of at most the pool − 64 MB − 17 MB of bss (counted as used memory): a 3328 MB heap region
-mem_reserve	0x100000000
+# main sets a heap of at most the pool − 64 MB − 17 MB of bss (counted as used memory). The pool is the Switch's 3285 MB plus 2 GB, as an emulator's 6 GB DRAM
+# layout: Unreal takes its heap from what the system reports, and render resolutions above 1440p (r.ScreenPercentage 150 and up) ran out in the Switch's (a deliberate
+# break 7 s in, with a save). Mac only: the 6 GB block is more than iOS gives one reservation besides Metal
+mem_reserve	0x180000000
 mem_alias	0x10000000
 mem_stack	0x10000000
-app_pool	0xCD500000
+app_pool	0x14D500000
 # the NPDM declares 0 MB of system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon (Big Brain Academy: Brain vs. Brain sets a heap only then)
 sys_resource	0x0
 
