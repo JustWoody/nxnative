@@ -233,12 +233,14 @@ int main(void) {
         CHECK(nvn_tex_level_offset(&d, 1) == 0x81000 && L.size == 0xBC400 && nvn_tex_level_gobs(&d, 0) == 43, "S not sparse: level 1 %#llx storage %#llx, expected 0x81000 / 0xbc400",
               (unsigned long long)nvn_tex_level_offset(&d, 1), (unsigned long long)L.size);
     }
-    {   // a sparse texture smaller than one tile is all mip tail, with the automatic block height: Yoshi's Crafted World's 192×160 BC3 sRGB loading-icon frames (48×40 blocks) in 4 GOBs,
+    {   // a sparse texture of one level smaller than one tile has the automatic block height: Yoshi's Crafted World's 192×160 BC3 sRGB loading-icon frames (48×40 blocks) in 4 GOBs,
         // as their dumped data decodes (with the tile's 8 the sprite came out split around a hole); one a whole tile in size keeps the tile's 8
         nvn_texdesc d = {1, 0x48, 0x20, 0, 192, 160, 1, 1, 0, 0}; nvn_texlayout L; nvn_tex_layout(&d, &L);
         CHECK(L.tileH == 2 && nvn_tex_level_gobs(&d, 0) == 12 && L.size == 0x10000, "S 192×160 BC3 sparse: block height log2 %u, %u GOBs wide, storage %#llx, expected 2 / 12 / 0x10000", L.tileH, nvn_tex_level_gobs(&d, 0), (unsigned long long)L.size);
         d.width = d.height = 256; nvn_tex_layout(&d, &L);
         CHECK(L.tileH == 3, "S 256×256 BC3 sparse: block height log2 %u, expected 3", L.tileH);
+        d.width = d.height = 128; d.levels = 8; nvn_tex_layout(&d, &L);   // one with mips takes the tile's 8, however small: Yoshi's 128×128 BC3 textures with 8 levels
+        CHECK(L.tileH == 3 && L.size == 0x10000, "S 128×128 BC3 sparse, 8 levels: block height log2 %u, storage %#llx, expected 3 / 0x10000", L.tileH, (unsigned long long)L.size);
     }
 
     printf("%s: %d/%d checks passed\n", fails ? "RED" : "all passed", checks - fails, checks);
