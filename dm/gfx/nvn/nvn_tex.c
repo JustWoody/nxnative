@@ -75,7 +75,8 @@ static int sparse_of(const nvn_texdesc *d) { return (d->flags & 0x20) && !(d->fl
 // 256×256 / 256×128 / 128×128 / 128×64 / 64×64 blocks for 1 / 2 / 4 / 8 / 16 bytes per block, so its rows make a block height of 32 / 16 / 16 / 8 / 8 GOBs
 // (log2 5 / 4 / 4 / 3 / 3); -1 for other block sizes. OCTOPATH TRAVELER's world map (4096×2048 BC1, 512 block rows) is laid out in 8 GOBs where the automatic rule gives 16:
 // read with 16, its 64 KB tiles came out shuffled into a patchwork; its 512×512 RGBA8 sprite sheets read right with 16, and Monster Hunter Rise's packaged ASTC 6×6 (16 bytes
-// per block) carry 8. Checked for 4, 8 and 16 bytes per block; the 1- and 2-byte heights follow the same tile shapes
+// per block) carry 8. Checked for 4, 8 and 16 bytes per block; the 1- and 2-byte heights follow the same tile shapes. A sparse texture smaller than one tile is all mip tail and keeps the
+// automatic block height: Yoshi's Crafted World's 192x160 BC3 loading-icon frames are laid out in 4 GOBs (read with 8, the sprite came out split, with a hole and stray magenta blocks)
 static int sparse_tile_h(unsigned bpb) { return bpb == 1 ? 5 : bpb == 2 || bpb == 4 ? 4 : bpb == 8 || bpb == 16 ? 3 : -1; }
 // Offset of level `level` from the start of its layer, and the GOB columns it is laid out with (*gobs, may be NULL)
 static uint64_t level_walk(const nvn_texdesc *d, unsigned level, unsigned dpl, uint32_t w, uint32_t h, uint32_t z,
@@ -127,7 +128,8 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         unsigned pl = (unsigned)(d->pkg_block_h - 1) & 0xff;
         if (dpl >= 2) tileH = pl & 0xf;
         if (dpl == 3) tileD = pl >> 4;
-    } else if (dpl == 2 && sparse_of(d) && sparse_tile_h(t.bpb) >= 0) tileH = (unsigned)sparse_tile_h(t.bpb);
+    } else if (dpl == 2 && sparse_of(d) && sparse_tile_h(t.bpb) >= 0 && blk(w * sx, t.bw) * t.bpb >= (128u >> sparse_tile_h(t.bpb)) * 64 && blk(h * sy, t.bh) >= 8u << sparse_tile_h(t.bpb))
+        tileH = (unsigned)sparse_tile_h(t.bpb);   // level 0 at least one tile wide and high; one smaller lies wholly in the mip tail, laid out with the automatic block height (sparse_tile_h)
     else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile(ah * 3 / 16); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     o->tileH = tileH; o->tileD = tileD;
