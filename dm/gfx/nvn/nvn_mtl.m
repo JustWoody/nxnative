@@ -2324,11 +2324,24 @@ static id<MTLTexture> tex_linear(const tex_t *t) {
 // CPU-written block-linear textures (WriteTexels): the game gave no packaged layout and changes the content from the CPU each frame (Engage's movie frames: a Y plane R8 + a UV plane RG8, WriteTexels every frame).
 // Only packaged textures used to be uploaded from guest memory, so such a texture became a GPU-only texture whose content stayed 0. Their serials are recorded and they resolve through the packaged path (upload + re-upload on dirty pages)
 static pthread_mutex_t g_cpu_tex_mu = PTHREAD_MUTEX_INITIALIZER; static CFMutableSetRef g_cpu_tex;
-// The GPU owns the texture's content: its host texture was made to be rendered into or written by shaders (nvn_ft_poll in hle_nvn.c never re-uploads such a texture from guest memory)
+// The GPU owns the texture's content: its host texture was made to be rendered into or written by shaders (nvn_ft_poll in hle_nvn.c never re-uploads such a texture from guest memory).
+// Profile tex_gpu_written: only a texture the GPU did write (a render pass attached it, a clear or a copy only the host texture holds) or a shader-writable image. Every GPU-only texture
+// of an uncompressed format is made render-target capable (tex_desc), so by usage none of them was ever picked up: Yoshi's Crafted World's sea mask (1024x1024 RGBA8, 11 levels), first
+// the destination of Unreal's streaming copy of its lower mips (made in guest memory too, tex_copy_guest), then given its higher mips on the CPU, kept a previous texture's ring pattern,
+// and the far sea of the world map came out dark green
+static CFMutableSetRef g_gpu_wrote; static pthread_mutex_t g_gpu_wrote_mu = PTHREAD_MUTEX_INITIALIZER;
+static void gpu_wrote(const tex_t *t) {
+    if (!DM_GAME_TEX_GPU_WRITTEN || !t || !t->serial) return;
+    pthread_mutex_lock(&g_gpu_wrote_mu); if (!g_gpu_wrote) g_gpu_wrote = CFSetCreateMutable(NULL, 0, NULL);
+    CFSetAddValue(g_gpu_wrote, (const void *)(uintptr_t)t->serial); pthread_mutex_unlock(&g_gpu_wrote_mu);
+}
 int mtl_tex_gpu_owned(uint64_t serial) {
     __unsafe_unretained id o = tex_get(serial);
     if (!o || ![o conformsToProtocol:@protocol(MTLTexture)]) return 0;
-    return (((id<MTLTexture>)o).usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
+    MTLTextureUsage u = ((id<MTLTexture>)o).usage;
+    if (!DM_GAME_TEX_GPU_WRITTEN) return (u & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
+    pthread_mutex_lock(&g_gpu_wrote_mu); int w = g_gpu_wrote && CFSetContainsValue(g_gpu_wrote, (const void *)(uintptr_t)serial); pthread_mutex_unlock(&g_gpu_wrote_mu);
+    return w || (u & MTLTextureUsageShaderWrite);
 }
 void mtl_tex_cpu_written(const tex_t *t) {
     uint64_t serial = t->serial;
@@ -9083,6 +9096,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     }
 }
 static void copy_b2t(const p_copy_b2t *c) {
+    gpu_wrote(c->tex);
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
     if (!t) { PD("C ser=%llu (no host texture)", c->tex->serial); return; }
@@ -9205,26 +9219,27 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 // streams a texture in by making a bigger one, copying the old one's levels into its smaller levels and only then writing the larger levels on the CPU; the upload that follows
 // left the copied levels stale (noise in the blurred foreground clouds) or zero (black). Same format, unscaled and unmirrored copies between 2D / 2D array / cube textures outside sparse pools
 #include "../tex/nvn_deswizzle.h"
-static void t2t_guest(const p_copy_t2t *c, unsigned sl, unsigned ss, unsigned dl, unsigned ds) {
+static int t2t_guest(const p_copy_t2t *c, unsigned sl, unsigned ss, unsigned dl, unsigned ds) {   // 1: made in the destination's guest memory too
     const tex_t *s = c->src, *d = c->dst; int bw, bh;
     if (!DM_GAME_TEX_COPY_GUEST || !s || !d || !s->mem || !d->mem || s->d.format != d->d.format || (c->flags & (DM_COPY_RESOLVE | NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT))
         || c->sr.width != c->dr.width || c->sr.height != c->dr.height || s->d.target == 2 || d->d.target == 2 || !nvn_fmt_bpb(d->d.format, &bw, &bh)
-        || (s->pool && nvn_sparse_pool(s->pool)) || (d->pool && nvn_sparse_pool(d->pool)) || ![tex_get(s->serial) isKindOfClass:[NvPkg class]]) return;
-    int nz = c->sr.depth > 0 ? c->sr.depth : 1;
+        || (s->pool && nvn_sparse_pool(s->pool)) || (d->pool && nvn_sparse_pool(d->pool)) || ![tex_get(s->serial) isKindOfClass:[NvPkg class]]) return 0;
+    int nz = c->sr.depth > 0 ? c->sr.depth : 1, done = 0;
     for (int z = 0; z < nz; z++) {
         uint32_t srb, srows, drb, drows, sls, bpb; uint64_t base; unsigned th, td;
-        if (nvn_deswizzle_geom(&s->d, sl, ss + c->sr.zoffset + z, &srb, &srows, &sls, &base, &th, &td, &bpb) || nvn_deswizzle_geom(&d->d, dl, ds + c->dr.zoffset + z, &drb, &drows, &sls, &base, &th, &td, &bpb)) return;
+        if (nvn_deswizzle_geom(&s->d, sl, ss + c->sr.zoffset + z, &srb, &srows, &sls, &base, &th, &td, &bpb) || nvn_deswizzle_geom(&d->d, dl, ds + c->dr.zoffset + z, &drb, &drows, &sls, &base, &th, &td, &bpb)) return done == nz;
         uint32_t sx = c->sr.xoffset / bw * bpb, sy = c->sr.yoffset / bh, dx = c->dr.xoffset / bw * bpb, dy = c->dr.yoffset / bh, wb = (c->sr.width + bw - 1) / bw * bpb, hr = (c->sr.height + bh - 1) / bh;
-        if (sx + wb > srb || sy + hr > srows || dx + wb > drb || dy + hr > drows) return;
+        if (sx + wb > srb || sy + hr > srows || dx + wb > drb || dy + hr > drows) return done == nz;
         uint8_t *sb = malloc((size_t)srb * srows), *db = malloc((size_t)drb * drows);
         int full = !dx && !dy && wb == drb && hr == drows;
         if (sb && db && !nvn_deswizzle(&s->d, sl, ss + c->sr.zoffset + z, s->mem, sb, srb) && (full || !nvn_deswizzle(&d->d, dl, ds + c->dr.zoffset + z, d->mem, db, drb))) {
             for (uint32_t y = 0; y < hr; y++) memcpy(db + (size_t)(dy + y) * drb + dx, sb + (size_t)(sy + y) * srb + sx, wb);
-            nvn_swizzle(&d->d, dl, ds + c->dr.zoffset + z, db, drb, d->mem);
+            nvn_swizzle(&d->d, dl, ds + c->dr.zoffset + z, db, drb, d->mem); done++;
             static int nl; if (nl++ < 4) MLOG("texture copy ser=%llu level %u → ser=%llu level %u made in guest memory too (tex_copy_guest)", (unsigned long long)s->serial, sl, (unsigned long long)d->serial, dl);
         }
         free(sb); free(db);
     }
+    return done == nz;
 }
 static void copy_t2t(const p_copy_t2t *c) {
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "texture copy source");
@@ -9242,7 +9257,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
     if (!tex_level_ok(s, sl, "texture copy source") || !tex_level_ok(d, dl, "texture copy destination")) return;
-    t2t_guest(c, sl, sz0, dl, dz0);
+    if (!t2t_guest(c, sl, sz0, dl, dz0)) gpu_wrote(c->dst);   // a copy only the host texture holds: the GPU owns the destination's content
     if (c->flags & DM_COPY_RESOLVE) {   // Downsample: multisample resolve into the single-sample destination (depth takes sample 0); with equal sample counts it is a plain whole copy
         if (s.sampleCount == d.sampleCount && s.pixelFormat == d.pixelFormat && s.width == d.width && s.height == d.height) {
             enc_b_copy_texture(blit(), s, sz0, sl, MTLOriginMake(0, 0, 0), MTLSizeMake(s.width, s.height, 1), d, dz0, dl, MTLOriginMake(0, 0, 0));
@@ -9329,6 +9344,7 @@ static unsigned mtl_pf_chmask(MTLPixelFormat pf) {
 // View with changed format: clear on that view. Partial colour regions / channel masks use a triangle and preserve everything else.
 static void clear_tex_tri(id<MTLTexture> t, unsigned lv, unsigned l0, const p_clear_tex *c);
 static void clear_tex(const p_clear_tex *c) {
+    gpu_wrote(c->tex);
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("X ser=%llu view format %#x region %d,%d,%d %dx%dx%d mask %#x %s %g,%g,%g,%g", c->tex->serial, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
@@ -9640,6 +9656,7 @@ void mtl_exec(const uint8_t *p) {
                    n >= 4 ? ((const float *)((const uint8_t *)a + 16))[0] : 0.f, n >= 8 ? ((const float *)((const uint8_t *)a + 16))[1] : 0.f, n >= 12 ? ((const float *)((const uint8_t *)a + 16))[2] : 0.f, n >= 16 ? ((const float *)((const uint8_t *)a + 16))[3] : 0.f); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
+                if (DM_GAME_TEX_GPU_WRITTEN) { for (int i = 0; i < r->n && i < 8; i++) gpu_wrote(r->color[i]); gpu_wrote(r->depth); }
                 if (defer_begin_q(p)) break;
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
                 if (g_enc && !pend && R.has_rt && tbdr_on() && rt_range_same(&R.rt,r)) {

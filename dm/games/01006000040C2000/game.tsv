@@ -46,3 +46,5 @@ tex_dirty_upload	on
 # Streams textures in by copying the old texture's levels into the new one's smaller levels on the GPU, then writing the larger ones on the CPU: the copies made in guest memory too
 # (nvn_mtl.m t2t_guest), or the upload after the CPU writes put back stale levels (black / noise on distant and blurred surfaces)
 tex_copy_guest	on
+# its sea mask (RGBA8, made render-target capable as every uncompressed GPU-only texture) is first a copy destination, then written on the CPU: only a texture the GPU wrote is GPU-owned
+tex_gpu_written	on
