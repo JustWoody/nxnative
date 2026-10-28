@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <sys/clonefile.h>
 #include <sys/xattr.h>
 
@@ -114,7 +115,41 @@ static int dm_fs_test_fail(const char *pt) {
 }
 static int in_txn_dir(const char *hp) { return save_txn_from_path(hp); }
 static int rm_tree(const char *p);
+// DM_UE_PATCH=<pak path in the RomFS>|<name in the pak>|<host file>[;...] (a Switch Ports menu row of an Unreal game, written by its launcher): each file goes into an Unreal patch pak at
+// that RomFS path under $DM_ROOT/uepak, which becomes the first RomFS overlay root. Unreal mounts every pak of Content/Paks and a name ending in _P outranks the game's own: OCTOPATH
+// TRAVELER II reads its device profile settings (Config/Switch/SwitchDeviceProfiles.ini) from such a pak, which shipping builds take no command-line override for (-dpcvars, -ini: and
+// -ExecCmds had no effect). The pak is version 3 (uncompressed, unencrypted, mount point ../../../), which Unreal 4.26 still mounts; entries and index carry their SHA-1 as it checks them
+static void ue_fstr(FILE *f, const char *s) { int32_t n = (int32_t)strlen(s) + 1; fwrite(&n, 4, 1, f); fwrite(s, 1, (size_t)n, f); }
+static void ue_entry(FILE *f, int64_t off, const void *d, int64_t n) {
+    int64_t v[3] = {off, n, n}; int32_t m = 0; uint8_t h[20], e = 0; uint32_t bs = 0; CC_SHA1(d, (CC_LONG)n, h);
+    fwrite(v, 8, 3, f); fwrite(&m, 4, 1, f); fwrite(h, 1, 20, f); fwrite(&e, 1, 1, f); fwrite(&bs, 4, 1, f);
+}
+static void ue_patch_init(void) {
+    static int done; if (done) return; done = 1;
+    const char *e = getenv("DM_UE_PATCH"), *root = getenv("DM_ROOT"); if (!e || !*e || !root) return;
+    char dir[1024]; snprintf(dir, sizeof dir, "%s/uepak", root);
+    char *spec = strdup(e), *save = NULL; int made = 0;
+    for (char *it = strtok_r(spec, ";", &save); it; it = strtok_r(NULL, ";", &save)) {
+        char *name = strchr(it, '|'), *src = name ? strchr(name + 1, '|') : NULL; if (!src) { LOG("[RED] DM_UE_PATCH entry without pak|name|file: %s", it); continue; }
+        *name++ = 0; *src++ = 0;
+        FILE *in = fopen(src, "rb"); if (!in) { LOG("[RED] DM_UE_PATCH: cannot read %s", src); continue; }
+        fseek(in, 0, SEEK_END); long n = ftell(in); fseek(in, 0, SEEK_SET); char *d = malloc((size_t)n + 1); n = (long)fread(d, 1, (size_t)n, in); fclose(in);
+        char out[1100]; snprintf(out, sizeof out, "%s/%s", dir, it);
+        mkdir(dir, 0755); for (char *s = out + strlen(dir) + 1; (s = strchr(s, '/')); s++) { *s = 0; mkdir(out, 0755); *s = '/'; }
+        FILE *f = fopen(out, "wb"); if (!f) { LOG("[RED] DM_UE_PATCH: cannot write %s", out); free(d); continue; }
+        ue_entry(f, 0, d, n); fwrite(d, 1, (size_t)n, f);
+        int64_t ioff = ftell(f);
+        char ib[4096]; FILE *mf = fmemopen(ib, sizeof ib, "wb"); ue_fstr(mf, "../../../"); int32_t one = 1; fwrite(&one, 4, 1, mf); ue_fstr(mf, name); ue_entry(mf, 0, d, n);
+        int64_t isz = ftell(mf); fclose(mf); fwrite(ib, 1, (size_t)isz, f);
+        uint32_t mg = 0x5A6F12E1; int32_t ver = 3; uint8_t h[20]; CC_SHA1(ib, (CC_LONG)isz, h);
+        fwrite(&mg, 4, 1, f); fwrite(&ver, 4, 1, f); fwrite(&ioff, 8, 1, f); fwrite(&isz, 8, 1, f); fwrite(h, 1, 20, f); fclose(f); free(d);
+        LOG("Unreal patch pak %s: %s (%ld bytes)", it, name, n); made++;
+    }
+    free(spec);
+    if (made) { const char *o = getenv("DM_ROMFS_OVERLAY"); char nv[4096]; snprintf(nv, sizeof nv, "%s%s%s", dir, o && *o ? ":" : "", o && *o ? o : ""); setenv("DM_ROMFS_OVERLAY", nv, 1); }
+}
 static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
+    ue_patch_init();   // before an overlay is read (see ue_patch_init)
     pthread_once(&g_txn_lock_once, txn_locks_init);
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nmnt; i++)
