@@ -270,12 +270,23 @@ static int pro_player(void) {   // the player of the first Pro Controller GameCo
         if ([c.productCategory rangeOfString:@"Pro Controller"].location != NSNotFound) { int p = pad_slot_of(&g_slots, (__bridge const void *)c); if (p >= 0) return p; }
     return 0;
 }
+// Capture (a Pro Controller's, an 8BitDo's star button) freezes the game where it is and resumes it: the graphics calls wait (dm_gfx_suspend, as when the app quits, so the game
+// stops on the frame it last drew, which stays on screen) and the sound goes to the silent sink (dm_audio_suspend). No banner, so a screenshot of it is clean. The suspend waits
+// for the submission in flight, so it runs off the HID callback's thread
+static void game_pause(const char *from) {
+    static int paused; int now = paused = !paused;   // only the HID callback's thread toggles it
+    LOG("pause: game %s (%s)", now ? "frozen" : "resumed", from);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ void dm_gfx_suspend(int), dm_audio_suspend(int); if (now) { dm_audio_suspend(1); dm_gfx_suspend(1); } else { dm_gfx_suspend(0); dm_audio_suspend(0); } });
+}
 static void pro_report(void *ctx, IOReturn res, void *sender, IOHIDReportType type, uint32_t id, uint8_t *r, CFIndex len) {
     (void)ctx; (void)res; (void)sender; (void)type; (void)id;
     if (len < 49 || r[0] != 0x30) return;
     static int home_down; int home = (r[4] & 0x10) != 0;   // byte 4: − + RS LS Home Capture; macOS does not pass a Pro Controller's Home to GameController
     if (home && !home_down && home_ok()) menu_home("Pro Controller report");
     home_down = home;
+    static int cap_down; int cap = (r[4] & 0x20) != 0;   // Capture (an 8BitDo's star): freezes the game on its frame, for a screenshot, and resumes it (game_pause)
+    if (cap && !cap_down && home_ok()) game_pause("Capture button");
+    cap_down = cap;
     if (!g_input_on) return;
     if (g_menu_open || !g_gyro_state) return;
     static int first = 1;
