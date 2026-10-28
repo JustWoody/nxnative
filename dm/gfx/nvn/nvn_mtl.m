@@ -424,7 +424,7 @@ void mtl_init(void) {
     }
     g_ev = [g_dev newSharedEvent];
     g_keep = [NSMutableArray array];
-    g_nvn_deswz_gpu = nvn_deswz_gpu_init(g_dev) == 0;
+    g_nvn_deswz_gpu = !getenv("DM_NVN_DESWZ_CPU") && nvn_deswz_gpu_init(g_dev) == 0;   // DM_NVN_DESWZ_CPU=1 (diagnostic): swizzled textures deswizzled on the CPU only
     dm_res_report_register(mtl_res_counts);
     if (!g_nvn_deswz_gpu) MLOG("[RED] GPU deswizzle init failed; swizzled textures fall back to the CPU");
     MLOG("Metal device %s", g_dev.name.UTF8String);
@@ -2054,6 +2054,11 @@ int nvn_host_readable(uint64_t a, uint64_t n);   // hle_nvn.c: guest memory and 
 int nvn_sparse_pool(const void *pool); uint64_t nvn_sparse_gen(void); uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n);
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp); void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n); int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n);
 static id<MTLTexture> pkg_upload(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse) {   // reuse: a texture of the same description, idle on the GPU, to upload into instead of a new one
+    { static int mc = -1; if (mc < 0) mc = getenv("DM_NVN_MIPCHECK") != NULL;   // Diagnostic DM_NVN_MIPCHECK=1: a texture uploaded with data in level 0 and an all-zero later level (not written yet)
+      if (mc && t->mem && t->d.levels > 1 && !(t->pool && nvn_sparse_pool(t->pool))) { char z[96]; int nz = 0, any0 = 0; z[0] = 0;
+        for (unsigned l = 0; l < t->d.levels && l < 16; l++) { uint64_t o = nvn_tex_level_offset(&t->d, l), e = l + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, l + 1) : t->L.size; if (e > t->L.size) e = t->L.size;
+            int has = 0; for (uint64_t i = o; i < e && !has; i++) has = ((const uint8_t *)t->mem)[i] != 0; if (!l) any0 = has; else if (!has && nz < 16) { nz++; snprintf(z + strlen(z), sizeof z - strlen(z), " %u", l); } }
+        static int nlog; if (any0 && nz && nlog++ < 40) MLOG("[mipcheck] ser=%llu %ux%u format %#x levels %u flags %#x: empty levels%s", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, t->d.flags, z); } }
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
     id<MTLTexture> r = pkg_upload_(t, stamp, reuse);
     clock_gettime(CLOCK_MONOTONIC, &b); uint64_t d_ = (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + b.tv_nsec - a.tv_nsec);
@@ -9195,6 +9200,32 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     return 1;
 }
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
+// Profile key tex_copy_guest: a texture copy out of a texture uploaded from guest memory is made in guest memory as well, into the destination's storage, as the Switch's GPU writes it
+// there: an upload of the destination from guest memory then keeps the copied levels instead of putting back what the memory held before. Yoshi's Crafted World (Unreal 4, SDK 4.4.1)
+// streams a texture in by making a bigger one, copying the old one's levels into its smaller levels and only then writing the larger levels on the CPU; the upload that follows
+// left the copied levels stale (noise in the blurred foreground clouds) or zero (black). Same format, unscaled and unmirrored copies between 2D / 2D array / cube textures outside sparse pools
+#include "../tex/nvn_deswizzle.h"
+static void t2t_guest(const p_copy_t2t *c, unsigned sl, unsigned ss, unsigned dl, unsigned ds) {
+    const tex_t *s = c->src, *d = c->dst; int bw, bh;
+    if (!DM_GAME_TEX_COPY_GUEST || !s || !d || !s->mem || !d->mem || s->d.format != d->d.format || (c->flags & (DM_COPY_RESOLVE | NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT))
+        || c->sr.width != c->dr.width || c->sr.height != c->dr.height || s->d.target == 2 || d->d.target == 2 || !nvn_fmt_bpb(d->d.format, &bw, &bh)
+        || (s->pool && nvn_sparse_pool(s->pool)) || (d->pool && nvn_sparse_pool(d->pool)) || ![tex_get(s->serial) isKindOfClass:[NvPkg class]]) return;
+    int nz = c->sr.depth > 0 ? c->sr.depth : 1;
+    for (int z = 0; z < nz; z++) {
+        uint32_t srb, srows, drb, drows, sls, bpb; uint64_t base; unsigned th, td;
+        if (nvn_deswizzle_geom(&s->d, sl, ss + c->sr.zoffset + z, &srb, &srows, &sls, &base, &th, &td, &bpb) || nvn_deswizzle_geom(&d->d, dl, ds + c->dr.zoffset + z, &drb, &drows, &sls, &base, &th, &td, &bpb)) return;
+        uint32_t sx = c->sr.xoffset / bw * bpb, sy = c->sr.yoffset / bh, dx = c->dr.xoffset / bw * bpb, dy = c->dr.yoffset / bh, wb = (c->sr.width + bw - 1) / bw * bpb, hr = (c->sr.height + bh - 1) / bh;
+        if (sx + wb > srb || sy + hr > srows || dx + wb > drb || dy + hr > drows) return;
+        uint8_t *sb = malloc((size_t)srb * srows), *db = malloc((size_t)drb * drows);
+        int full = !dx && !dy && wb == drb && hr == drows;
+        if (sb && db && !nvn_deswizzle(&s->d, sl, ss + c->sr.zoffset + z, s->mem, sb, srb) && (full || !nvn_deswizzle(&d->d, dl, ds + c->dr.zoffset + z, d->mem, db, drb))) {
+            for (uint32_t y = 0; y < hr; y++) memcpy(db + (size_t)(dy + y) * drb + dx, sb + (size_t)(sy + y) * srb + sx, wb);
+            nvn_swizzle(&d->d, dl, ds + c->dr.zoffset + z, db, drb, d->mem);
+            static int nl; if (nl++ < 4) MLOG("texture copy ser=%llu level %u → ser=%llu level %u made in guest memory too (tex_copy_guest)", (unsigned long long)s->serial, sl, (unsigned long long)d->serial, dl);
+        }
+        free(sb); free(db);
+    }
+}
 static void copy_t2t(const p_copy_t2t *c) {
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "texture copy source");
     rp_flush();   // Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
@@ -9211,6 +9242,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
     if (!tex_level_ok(s, sl, "texture copy source") || !tex_level_ok(d, dl, "texture copy destination")) return;
+    t2t_guest(c, sl, sz0, dl, dz0);
     if (c->flags & DM_COPY_RESOLVE) {   // Downsample: multisample resolve into the single-sample destination (depth takes sample 0); with equal sample counts it is a plain whole copy
         if (s.sampleCount == d.sampleCount && s.pixelFormat == d.pixelFormat && s.width == d.width && s.height == d.height) {
             enc_b_copy_texture(blit(), s, sz0, sl, MTLOriginMake(0, 0, 0), MTLSizeMake(s.width, s.height, 1), d, dz0, dl, MTLOriginMake(0, 0, 0));

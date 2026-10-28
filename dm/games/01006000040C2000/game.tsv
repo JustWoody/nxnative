@@ -41,3 +41,6 @@ mem_used	0x70e4000
 # Textures the CPU writes straight into memory pools (as OCTOPATH TRAVELER, Unreal 4 on an early SDK): without these the cardboard materials were black and others noise
 tex_flush_upload	on
 tex_dirty_upload	on
+# Streams textures in by copying the old texture's levels into the new one's smaller levels on the GPU, then writing the larger ones on the CPU: the copies made in guest memory too
+# (nvn_mtl.m t2t_guest), or the upload after the CPU writes put back stale levels (black / noise on distant and blurred surfaces)
+tex_copy_guest	on
