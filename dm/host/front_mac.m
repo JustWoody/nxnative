@@ -26,7 +26,7 @@ static int g_w, g_a, g_s, g_d;
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
 static int g_menu_open, g_menu_swallow, g_abxy = -2;   // the in-game menu (end of this file) is up; controller buttons held as it closed, kept from the game until released; DM_PAD_ABXY
 static struct mp { const void *who; uint64_t prev; int prev_y; } g_mpad[8]; static int g_mpad_n;   // menu_pad's controllers (emptied by menu_open)
-static int menu_key(unsigned short c, int down); static void menu_pad(uint64_t m, int32_t ly, const void *who); static void menu_toggle(void); static void menu_home(const char *from); static void hdr_apply(int lvl);
+static void game_pause(const char *from); static int menu_key(unsigned short c, int down); static void menu_pad(uint64_t m, int32_t ly, const void *who); static void menu_toggle(void); static void menu_home(const char *from); static void hdr_apply(int lvl);
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
@@ -107,7 +107,8 @@ static void on_key(NSEvent *e, int down) {
     if (menu_key(c, down)) return;
     switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
     int b = key_bit(c);
-    uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
+    if (c == 49) { if (down && !e.isARepeat) game_pause("Space"); return; }   // Space freezes and resumes the game, as Capture does (game_pause)
+    uint64_t m = b >= 0 ? 1ull << b : c == 7 ? DM_BTN_SHAKE : 0;   // X: shaken while held (it was Space until Space became pause)
     g_btn = down ? (g_btn | m) : (g_btn & ~m);
     push();
 }
@@ -270,7 +271,7 @@ static int pro_player(void) {   // the player of the first Pro Controller GameCo
         if ([c.productCategory rangeOfString:@"Pro Controller"].location != NSNotFound) { int p = pad_slot_of(&g_slots, (__bridge const void *)c); if (p >= 0) return p; }
     return 0;
 }
-// Capture (a Pro Controller's, an 8BitDo's star button) freezes the game where it is and resumes it: the graphics calls wait (dm_gfx_suspend, as when the app quits, so the game
+// Capture (a Pro Controller's, an 8BitDo's star button) or Space freezes the game where it is and resumes it: the graphics calls wait (dm_gfx_suspend, as when the app quits, so the game
 // stops on the frame it last drew, which stays on screen) and the sound goes to the silent sink (dm_audio_suspend). No banner, so a screenshot of it is clean. The suspend waits
 // for the submission in flight, so it runs off the HID callback's thread
 static void game_pause(const char *from) {
